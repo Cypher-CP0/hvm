@@ -1,0 +1,10 @@
+[package]
+name = "vmm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The VMM binary: guest memory, device model and vCPU run loop"
+
+[dependencies]
+hypervisor = { path = "../hypervisor" }
+vm-memory = { version = "0.18", features = ["backend-mmap"] }

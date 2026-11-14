@@ -1,0 +1,9 @@
+/target
+*.swp
+.vscode/
+.idea/
+# guest artifacts (kernels, initrds, disk images) stay out of git
+/guest/
+*.img
+bzImage
+vmlinux

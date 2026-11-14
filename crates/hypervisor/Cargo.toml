@@ -1,0 +1,13 @@
+[package]
+name = "hypervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Backend-agnostic hypervisor abstraction (KVM today, WHPX later)"
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-ioctls = "0.25"
+kvm-bindings = "0.14"

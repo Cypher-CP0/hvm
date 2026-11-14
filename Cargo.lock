@@ -121,6 +121,7 @@ name = "vmm"
 version = "0.1.0"
 dependencies = [
  "hypervisor",
+ "thiserror",
  "vm-memory",
 ]
 

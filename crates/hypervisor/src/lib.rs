@@ -8,6 +8,9 @@ use std::fmt;
 
 #[cfg(target_os = "linux")]
 pub mod kvm;
+pub mod x86_64;
+
+use x86_64::{SpecialRegs, StandardRegs};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -141,10 +144,18 @@ pub trait Vm {
 
 /// A virtual CPU. Owned and driven by exactly one host thread.
 pub trait Vcpu {
-    /// Put the vCPU in 16-bit real mode with flat zero-based segments and the
-    /// instruction pointer at `entry`. Day 2 replaces this with full
-    /// register/long-mode setup.
-    fn setup_real_mode(&mut self, entry: u16) -> Result<()>;
+    /// Expose the host-supported CPUID leaves to the guest. Must be called
+    /// before the special registers are set: the backend validates control
+    /// register and EFER values against the guest's CPUID.
+    fn init_cpuid(&mut self) -> Result<()>;
+
+    fn get_regs(&self) -> Result<StandardRegs>;
+    fn set_regs(&mut self, regs: &StandardRegs) -> Result<()>;
+
+    fn get_sregs(&self) -> Result<SpecialRegs>;
+    /// Set the special registers. State not covered by [`SpecialRegs`]
+    /// (APIC base, pending interrupts) is left untouched.
+    fn set_sregs(&mut self, sregs: &SpecialRegs) -> Result<()>;
 
     /// Enter the guest and block until it exits.
     fn run(&mut self) -> Result<VmExit<'_>>;

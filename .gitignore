@@ -7,3 +7,5 @@
 *.img
 bzImage
 vmlinux
+# project notes: goals, requirements, progress, current state
+/guest-vms/

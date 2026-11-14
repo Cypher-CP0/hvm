@@ -1,11 +1,11 @@
-//! Day 5: boot Linux with an initrd to an interactive shell on the serial
-//! console.
+//! tvm: a virtual machine monitor for Linux guests on KVM.
 
 mod arch;
 #[cfg(unix)]
 mod console;
 mod devices;
 mod guest;
+mod metrics;
 mod platform;
 
 use std::error::Error;
@@ -16,12 +16,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hypervisor::{ExitKind, Hypervisor, IrqLine, Vcpu, Vm, VmExit};
+use hypervisor::{Hypervisor, IrqLine, Vcpu, Vm, VmExit};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
 use arch::x86_64::layout::{HIMEM_START, MAX_MEM_SIZE};
 use arch::x86_64::{linux, regs};
-use platform::{Access, Com1, PioOutcome, Platform, COM1_IRQ};
+use metrics::{BootWatch, ExitStats, Timeline};
+use platform::{Access, Com1, IoCount, PioOutcome, Platform, COM1_IRQ};
 
 const DEFAULT_MEM_MIB: u64 = 512;
 /// The built-in test guest writes at 64 MiB.
@@ -41,6 +42,11 @@ const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=k panic=-1 pci=off";
 /// goes away with the event loop in week 2.
 const INPUT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
+/// Exits per measurement in `--bench-exits`.
+const BENCH_ITERATIONS: u32 = 100_000;
+/// How many of the busiest I/O addresses to list at exit.
+const IO_REPORT_ROWS: usize = 10;
+
 const USAGE: &str = "\
 usage: vmm [options]
 
@@ -52,6 +58,7 @@ options:
   --cmdline <str>    kernel command line (replaces the default)
   --append <str>     extra kernel command line options, added to the end
   --mem <MiB>        guest memory size (default 512)
+  --bench-exits      measure the cost of a VM exit and stop
   -h, --help         show this help
 
 While a kernel is running the terminal belongs to the guest:
@@ -63,6 +70,7 @@ struct Config {
     kernel: Option<String>,
     initrd: Option<String>,
     cmdline: String,
+    bench_exits: bool,
 }
 
 impl Config {
@@ -72,6 +80,7 @@ impl Config {
             kernel: None,
             initrd: None,
             cmdline: DEFAULT_CMDLINE.to_string(),
+            bench_exits: false,
         };
         let mut append = Vec::new();
         while let Some(arg) = args.next() {
@@ -87,6 +96,7 @@ impl Config {
                         .parse()
                         .map_err(|_| format!("--mem: '{v}' is not a number of MiB"))?;
                 }
+                "--bench-exits" => cfg.bench_exits = true,
                 "-h" | "--help" => return Ok(None),
                 other => return Err(format!("unknown argument '{other}'")),
             }
@@ -97,6 +107,9 @@ impl Config {
         }
         if cfg.initrd.is_some() && cfg.kernel.is_none() {
             return Err("--initrd needs --kernel".to_string());
+        }
+        if cfg.bench_exits && cfg.kernel.is_some() {
+            return Err("--bench-exits runs its own guest; drop --kernel".to_string());
         }
         let max_mib = MAX_MEM_SIZE >> 20;
         if !(MIN_MEM_MIB..=max_mib).contains(&cfg.mem_mib) {
@@ -127,49 +140,42 @@ enum StopReason {
     Reset,
 }
 
-#[derive(Default)]
-struct ExitStats {
-    counts: [u64; ExitKind::COUNT],
-    run_time: Duration,
+/// Everything a finished VM run has to report.
+struct RunOutcome {
+    reason: StopReason,
+    stats: ExitStats,
+    /// Addresses the guest accessed, most frequent first.
+    io: Vec<IoCount>,
 }
 
-impl ExitStats {
-    fn record(&mut self, kind: ExitKind) {
-        self.counts[kind as usize] += 1;
-    }
-
-    fn count(&self, kind: ExitKind) -> u64 {
-        self.counts[kind as usize]
-    }
-
-    fn report(&self) {
-        eprintln!("--- vm exits ---");
-        for kind in ExitKind::ALL {
-            let n = self.count(kind);
-            if n > 0 {
-                eprintln!("{kind:<12} {n}");
-            }
-        }
-        eprintln!("{:<12} {}", "total", self.counts.iter().sum::<u64>());
-        eprintln!("{:<12} {:.3}s", "run time", self.run_time.as_secs_f64());
-    }
-}
-
-fn report_unhandled<W: Write>(platform: &Platform<W>) {
-    const SHOWN: usize = 12;
-    let unhandled = platform.unhandled();
-    if unhandled.is_empty() {
+fn report_io(io: &[IoCount]) {
+    if io.is_empty() {
         return;
     }
-    eprintln!("--- unhandled i/o (top {SHOWN} of {}) ---", unhandled.len());
-    for (access, addr, count) in unhandled.into_iter().take(SHOWN) {
-        let name = match access {
+    let unhandled = io.iter().filter(|c| !c.handled).count();
+    eprintln!(
+        "--- i/o by address (top {IO_REPORT_ROWS} of {}, {unhandled} unhandled) ---",
+        io.len()
+    );
+    for c in io.iter().take(IO_REPORT_ROWS) {
+        let name = match c.access {
             Access::PioRead => "pio read",
             Access::PioWrite => "pio write",
             Access::MmioRead => "mmio read",
             Access::MmioWrite => "mmio write",
         };
-        eprintln!("{name:<12} {addr:#8x}  x{count}");
+        let note = if c.handled { "" } else { "  unhandled" };
+        eprintln!("{name:<12} {:#8x} {:>9}{note}", c.addr, c.count);
+    }
+    // Unhandled accesses are worth seeing even when they are rare.
+    for c in io.iter().skip(IO_REPORT_ROWS).filter(|c| !c.handled) {
+        let name = match c.access {
+            Access::PioRead => "pio read",
+            Access::PioWrite => "pio write",
+            Access::MmioRead => "mmio read",
+            Access::MmioWrite => "mmio write",
+        };
+        eprintln!("{name:<12} {:#8x} {:>9}  unhandled", c.addr, c.count);
     }
 }
 
@@ -242,14 +248,15 @@ where
 /// long mode, and run it until it stops.
 ///
 /// Bytes the guest writes to COM1 go to `serial`; bytes read from `input`
-/// arrive on COM1.
+/// arrive on COM1. Milestones are recorded on `timeline`.
 fn run_vm<H, W>(
     hv: &H,
     mem_size: u64,
     payload: Payload<'_>,
     serial: W,
     input: Option<Box<dyn Read + Send>>,
-) -> Result<(StopReason, ExitStats), Box<dyn Error>>
+    timeline: &Timeline,
+) -> Result<RunOutcome, Box<dyn Error>>
 where
     H: Hypervisor,
     W: Write + Send + 'static,
@@ -272,6 +279,8 @@ where
             )?;
         }
     }
+
+    timeline.mark(metrics::EVENT_VM_CREATED);
 
     // The interrupt line for COM1, if the VM has interrupt controllers.
     let mut com1_irq: Option<Box<dyn IrqLine>> = None;
@@ -305,14 +314,19 @@ where
         }
     };
 
+    timeline.mark(metrics::EVENT_GUEST_LOADED);
+
+    let serial = BootWatch::new(serial, timeline.clone());
     let mut platform = Platform::new(serial, com1_irq);
     if let Some(input) = input {
         spawn_console_input(input, platform.com1())?;
     }
 
     let mut stats = ExitStats::default();
+    timeline.mark(metrics::EVENT_VCPU_STARTED);
     let started = Instant::now();
-    let result = loop {
+    let result: Result<StopReason, Box<dyn Error>> = loop {
+        let entered = Instant::now();
         let exit = match vcpu.run() {
             Ok(exit) => exit,
             Err(e) => {
@@ -320,50 +334,108 @@ where
                 break Err(e.into());
             }
         };
-        stats.record(exit.kind());
-        match exit {
+        let exited = Instant::now();
+        let kind = exit.kind();
+        // `Ok(None)` means carry on.
+        let step: Result<Option<StopReason>, Box<dyn Error>> = match exit {
             VmExit::IoOut { port, data } => match platform.pio_write(port, data) {
-                Ok(PioOutcome::Continue) => {}
-                Ok(PioOutcome::Reset) => break Ok(StopReason::Reset),
-                Err(e) => break Err(e.into()),
+                Ok(PioOutcome::Continue) => Ok(None),
+                Ok(PioOutcome::Reset) => Ok(Some(StopReason::Reset)),
+                Err(e) => Err(e.into()),
             },
-            VmExit::IoIn { port, data } => {
-                if let Err(e) = platform.pio_read(port, data) {
-                    break Err(e.into());
-                }
+            VmExit::IoIn { port, data } => platform
+                .pio_read(port, data)
+                .map(|()| None)
+                .map_err(Into::into),
+            VmExit::MmioWrite { addr, .. } => {
+                platform.mmio_write(addr);
+                Ok(None)
             }
-            VmExit::MmioWrite { addr, .. } => platform.mmio_write(addr),
-            VmExit::MmioRead { addr, data } => platform.mmio_read(addr, data),
-            VmExit::Interrupted => {}
-            VmExit::Hlt => break Ok(StopReason::Halted),
+            VmExit::MmioRead { addr, data } => {
+                platform.mmio_read(addr, data);
+                Ok(None)
+            }
+            VmExit::Interrupted => Ok(None),
+            VmExit::Hlt => Ok(Some(StopReason::Halted)),
             VmExit::Shutdown => {
                 dump_state(&vcpu);
-                break Err("guest shut down unexpectedly (triple fault?)".into());
+                Err("guest shut down unexpectedly (triple fault?)".into())
             }
+        };
+        stats.record(kind, exited - entered, exited.elapsed());
+        match step {
+            Ok(None) => {}
+            Ok(Some(reason)) => break Ok(reason),
+            Err(e) => break Err(e),
         }
     };
     stats.run_time = started.elapsed();
+    timeline.mark(metrics::EVENT_STOPPED);
     platform.flush()?;
-    report_unhandled(&platform);
-    result.map(|reason| (reason, stats))
+    Ok(RunOutcome {
+        reason: result?,
+        stats,
+        io: platform.io_counts(),
+    })
+}
+
+/// Measure what a VM exit costs on this host, with two guests that do
+/// nothing but exit: once to the hypervisor only, once all the way to the
+/// VMM and back.
+fn bench_exits<H: Hypervisor>(hv: &H) -> Result<(), Box<dyn Error>> {
+    let n = BENCH_ITERATIONS;
+    let cases = [
+        ("hypervisor only (cpuid)", guest::cpuid_loop(n), 0),
+        ("to the vmm (port write)", guest::pio_loop(n), n as u64),
+    ];
+    println!("vm exit round trip, {n} exits each:");
+    for (name, code, expected_vmm_exits) in cases {
+        let timeline = Timeline::new(Instant::now());
+        let outcome = run_vm(
+            hv,
+            MIN_MEM_MIB << 20,
+            Payload::Raw(&code),
+            io::sink(),
+            None,
+            &timeline,
+        )?;
+        // Each guest ends with one HLT exit on top of what it measures.
+        let vmm_exits = outcome.stats.total() - 1;
+        if outcome.reason != StopReason::Halted || vmm_exits != expected_vmm_exits {
+            return Err(format!(
+                "{name}: guest did not behave as expected ({:?}, {vmm_exits} exits to the vmm)",
+                outcome.reason
+            )
+            .into());
+        }
+        println!(
+            "  {name:<26} {:>9} each",
+            metrics::human(outcome.stats.run_time / n)
+        );
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn run(cfg: &Config) -> Result<(), Box<dyn Error>> {
+fn run(cfg: &Config, timeline: &Timeline) -> Result<(), Box<dyn Error>> {
     let hv = hypervisor::kvm::KvmHypervisor::new()?;
     eprintln!("kvm api version {}", hv.api_version());
+    if cfg.bench_exits {
+        return bench_exits(&hv);
+    }
 
     let mem_size = cfg.mem_mib << 20;
     let open = |what: &str, path: &str| {
         File::open(path).map_err(|e| format!("cannot open {what} '{path}': {e}"))
     };
-    let (reason, stats) = match &cfg.kernel {
+    let outcome = match &cfg.kernel {
         None => run_vm(
             &hv,
             mem_size,
             Payload::Raw(&guest::HELLO64),
             io::stdout(),
             None,
+            timeline,
         )?,
         Some(path) => {
             let mut image = open("kernel", path)?;
@@ -380,23 +452,34 @@ fn run(cfg: &Config) -> Result<(), Box<dyn Error>> {
             let input = console::TerminalInput::new(io::stdin());
             // Hand the terminal to the guest for as long as it runs.
             let _raw_mode = console::enter_raw_mode()?;
-            run_vm(&hv, mem_size, payload, output, Some(Box::new(input)))?
+            run_vm(
+                &hv,
+                mem_size,
+                payload,
+                output,
+                Some(Box::new(input)),
+                timeline,
+            )?
         }
     };
-    match reason {
+    match outcome.reason {
         StopReason::Halted => eprintln!("guest halted"),
         StopReason::Reset => eprintln!("guest requested reset"),
     }
-    stats.report();
+    timeline.report();
+    outcome.stats.report();
+    report_io(&outcome.io);
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn run(_cfg: &Config) -> Result<(), Box<dyn Error>> {
+fn run(_cfg: &Config, _timeline: &Timeline) -> Result<(), Box<dyn Error>> {
     Err("no hypervisor backend for this OS yet; build and run inside WSL2 or Linux".into())
 }
 
 fn main() -> ExitCode {
+    // Time zero for the boot timeline: as early as we can observe.
+    let timeline = Timeline::new(Instant::now());
     let cfg = match Config::parse(std::env::args().skip(1)) {
         Ok(Some(cfg)) => cfg,
         Ok(None) => {
@@ -408,7 +491,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&cfg) {
+    match run(&cfg, &timeline) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -431,7 +514,9 @@ mod tests {
         assert_eq!(cfg.mem_mib, DEFAULT_MEM_MIB);
         assert!(cfg.kernel.is_none());
         assert!(cfg.initrd.is_none());
+        assert!(!cfg.bench_exits);
         assert_eq!(cfg.cmdline, DEFAULT_CMDLINE);
+        assert!(parse(&["--bench-exits"]).unwrap().unwrap().bench_exits);
 
         let cfg = parse(&[
             "--kernel",
@@ -480,6 +565,7 @@ mod tests {
         assert!(parse(&["--mem", "lots"]).is_err());
         assert!(parse(&["--mem", "16"]).is_err());
         assert!(parse(&["--mem", "4096"]).is_err());
+        assert!(parse(&["--bench-exits", "--kernel", "bzImage"]).is_err());
         assert!(parse(&["--bogus"]).is_err());
     }
 
@@ -487,6 +573,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod kvm {
         use super::super::*;
+        use hypervisor::ExitKind;
 
         /// Something has gone wrong if a guest runs for this long. There is
         /// no way to stop a running vCPU yet, so give up on the whole test
@@ -569,16 +656,23 @@ mod tests {
         fn long_mode_guest_prints_and_halts() {
             let Some(hv) = hypervisor() else { return };
             let serial = SharedBuf::default();
-            let (reason, stats) = run_vm(
+            let timeline = Timeline::new(Instant::now());
+            let RunOutcome { reason, stats, io } = run_vm(
                 &hv,
                 MIN_MEM_MIB << 20,
                 Payload::Raw(&guest::HELLO64),
                 serial.clone(),
                 None,
+                &timeline,
             )
             .unwrap();
 
             assert_eq!(reason, StopReason::Halted);
+            assert!(timeline.get(metrics::EVENT_FIRST_OUTPUT).is_some());
+            assert!(timeline.get(metrics::EVENT_USERSPACE).is_none());
+            // One address, COM1's data register, written once per byte.
+            assert_eq!(io.len(), 1);
+            assert_eq!(io[0].count, guest::HELLO64_OUTPUT.len() as u64);
             assert_eq!(serial.0.lock().unwrap().as_slice(), guest::HELLO64_OUTPUT);
             assert_eq!(
                 stats.count(ExitKind::IoOut),
@@ -604,8 +698,17 @@ mod tests {
                 initrd: None,
                 cmdline: DEFAULT_CMDLINE,
             };
-            let (reason, _) =
-                run_vm(&hv, DEFAULT_MEM_MIB << 20, payload, serial.clone(), None).unwrap();
+            let timeline = Timeline::new(Instant::now());
+            let outcome = run_vm(
+                &hv,
+                DEFAULT_MEM_MIB << 20,
+                payload,
+                serial.clone(),
+                None,
+                &timeline,
+            )
+            .unwrap();
+            let reason = outcome.reason;
 
             let log = serial.contents();
             assert!(log.contains("Linux version"), "no kernel banner in:\n{log}");
@@ -613,7 +716,38 @@ mod tests {
                 log.contains("ttyS0 at I/O 0x3f8") && log.contains("16550A"),
                 "8250 driver did not detect COM1 as a 16550A in:\n{log}"
             );
+            assert!(
+                log.contains("serio: i8042 KBD port"),
+                "keyboard controller probe did not succeed in:\n{log}"
+            );
             assert_eq!(reason, StopReason::Reset);
+        }
+
+        /// The benchmark guests must do exactly the exits they claim to.
+        #[test]
+        fn benchmark_guests_exit_as_designed() {
+            let Some(hv) = hypervisor() else { return };
+            let run = |code: &[u8]| {
+                let timeline = Timeline::new(Instant::now());
+                run_vm(
+                    &hv,
+                    MIN_MEM_MIB << 20,
+                    Payload::Raw(code),
+                    io::sink(),
+                    None,
+                    &timeline,
+                )
+                .unwrap()
+            };
+
+            let pio = run(&guest::pio_loop(1000));
+            assert_eq!(pio.reason, StopReason::Halted);
+            assert_eq!(pio.stats.count(ExitKind::IoOut), 1000);
+            assert_eq!(pio.stats.total(), 1001);
+
+            let cpuid = run(&guest::cpuid_loop(1000));
+            assert_eq!(cpuid.reason, StopReason::Halted);
+            assert_eq!(cpuid.stats.total(), 1, "CPUID must not reach the VMM");
         }
 
         /// Boots to a shell in the initrd, types a command and reboots,
@@ -650,18 +784,21 @@ mod tests {
                 // the kernel, which resets the machine just the same.
                 script: Some(b"echo vmm-$((6*7)); /bin/busybox reboot -f || exit\n"),
             };
-            let (reason, _) = run_vm(
+            let timeline = Timeline::new(Instant::now());
+            let outcome = run_vm(
                 &hv,
                 DEFAULT_MEM_MIB << 20,
                 payload,
                 serial.clone(),
                 Some(Box::new(input)),
+                &timeline,
             )
             .unwrap();
 
             let log = serial.contents();
             assert!(log.contains("vmm-42"), "command output missing in:\n{log}");
-            assert_eq!(reason, StopReason::Reset);
+            assert_eq!(outcome.reason, StopReason::Reset);
+            assert!(timeline.get(metrics::EVENT_USERSPACE).is_some());
         }
     }
 }

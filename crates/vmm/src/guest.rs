@@ -16,3 +16,40 @@ pub const HELLO64: [u8; 95] = [
 
 #[cfg(test)]
 pub const HELLO64_OUTPUT: &[u8] = b"Hello from 64-bit long mode!\n";
+
+/// Benchmark guest: `iterations` port writes, each of which exits all the
+/// way to the VMM, then halt.
+///
+/// ```text
+///  0: b9 imm32       mov  ecx, iterations
+///  5: 66 ba 80 00    mov  dx, 0x80        ; POST port: accepted and ignored
+///  9: ee             out  dx, al
+///  a: ff c9          dec  ecx
+///  c: 75 fb          jnz  9
+///  e: f4             hlt
+/// ```
+pub fn pio_loop(iterations: u32) -> Vec<u8> {
+    let mut code = vec![0xb9];
+    code.extend_from_slice(&iterations.to_le_bytes());
+    code.extend_from_slice(&[0x66, 0xba, 0x80, 0x00, 0xee, 0xff, 0xc9, 0x75, 0xfb, 0xf4]);
+    code
+}
+
+/// Benchmark guest: `iterations` CPUID instructions, each of which exits to
+/// the hypervisor but is answered there without involving the VMM, then
+/// halt.
+///
+/// ```text
+///  0: bf imm32       mov  edi, iterations ; CPUID clobbers eax-edx
+///  5: 31 c0          xor  eax, eax
+///  7: 0f a2          cpuid
+///  9: ff cf          dec  edi
+///  b: 75 f8          jnz  5
+///  d: f4             hlt
+/// ```
+pub fn cpuid_loop(iterations: u32) -> Vec<u8> {
+    let mut code = vec![0xbf];
+    code.extend_from_slice(&iterations.to_le_bytes());
+    code.extend_from_slice(&[0x31, 0xc0, 0x0f, 0xa2, 0xff, 0xcf, 0x75, 0xf8, 0xf4]);
+    code
+}

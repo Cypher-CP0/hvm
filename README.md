@@ -1,12 +1,28 @@
-# vmm
+# tvm
 
-A from-scratch virtual machine monitor in Rust. Working name; rename freely.
+tvm is a virtual machine monitor written in Rust. It runs Linux guests on KVM with a deliberately small device model: no firmware, no legacy hardware beyond what a kernel needs to boot, and a short path between the guest and the host for everything else.
+
+It is built around one rule: every VM exit has to be accounted for. Each run reports how many exits the guest caused, which addresses caused them and what they cost, so that a change can be judged by measurement.
+
+## What it does
+
+- Boots a Linux `bzImage` directly in 64-bit mode through the Linux boot protocol, with an optional initrd. There is no BIOS or bootloader stage.
+- Provides a 16550A serial console with interrupts, wired to your terminal, and an i8042 controller for reset.
+- Uses the hypervisor's own interrupt controllers and timer (PIC, IOAPIC, LAPIC, PIT).
+- Reports a boot timeline, exit counts and timings, and the busiest I/O addresses for every run.
+- Keeps the hypervisor behind a small trait interface. KVM is the only backend today; the interface is shaped so that a Windows Hypervisor Platform backend can be added without touching devices or boot code.
 
 ## Layout
 
-- `crates/hypervisor` — backend-agnostic traits (`Hypervisor`, `Vm`, `Vcpu`, `VmExit`), x86-64 register types, and the KVM backend. A WHPX backend slots in here later.
-- `crates/vmm` — the binary: guest memory, x86-64 boot setup and Linux boot protocol (`arch/x86_64`), emulated devices (`devices/`), the legacy PC platform that maps them to I/O ports (`platform.rs`), the host terminal (`console.rs`), vCPU run loop.
-- `crates/vmm/guests` — assembly sources for the built-in test guests.
+- `crates/hypervisor` — backend-agnostic traits (`Hypervisor`, `Vm`, `Vcpu`, `IrqLine`, `VmExit`), x86-64 register types, and the KVM backend.
+- `crates/vmm` — the binary:
+  - `arch/x86_64` — memory layout, GDT, page tables, boot registers, Linux boot protocol
+  - `devices` — emulated devices (16550A UART, i8042)
+  - `platform.rs` — maps devices to the legacy PC I/O ports
+  - `console.rs` — the host terminal
+  - `metrics.rs` — exit statistics and the boot timeline
+  - `guests` — assembly sources for the built-in test guests
+- `scripts` — benchmarks.
 
 ## Requirements
 
@@ -25,7 +41,6 @@ cargo run -- --kernel guest/vmlinuz-virt   # boot a Linux kernel, no root filesy
 cargo run -- --kernel guest/vmlinuz-virt --initrd guest/initramfs-virt \
   --append rdinit=/bin/sh                  # boot to a shell
 cargo run -- --help
-cargo test                                 # KVM tests skip themselves without /dev/kvm
 ```
 
 ### Getting a kernel and initrd
@@ -56,11 +71,38 @@ busybox --install -s
 mount -t proc proc /proc
 ```
 
-Leave with `busybox reboot -f`. The guest resets and the VMM prints its exit statistics.
+Leave with `busybox reboot -f`. The guest resets and the VMM prints its report.
 
-Without an initrd there is no root filesystem, so the boot ends in a kernel panic followed by the same reset. That is expected.
+Without an initrd there is no root filesystem, so the boot ends in a kernel panic followed by the same reset.
 
-### Tests against a real kernel
+## Measuring
+
+Every run ends with three tables on stderr:
+
+- **timeline** — when the VM was created, the guest loaded, the vCPU started, the first console byte appeared, user space started, and the guest stopped, measured from process start.
+- **vm exits** — count per exit kind, and the time the VMM spent handling them. The run time is split into time inside the guest and hypervisor, and time in the VMM.
+- **i/o by address** — the ports and MMIO addresses the guest touched most, and any that no device claimed.
+
+Two benchmarks:
+
+```sh
+cargo run --release -- --bench-exits       # cost of one VM exit on this host
+scripts/boot-bench.sh                      # boot time against QEMU microvm
+```
+
+`--bench-exits` runs two guests that do nothing but exit: one with an instruction the hypervisor answers itself, one with a port write that travels to the VMM and back. The difference is the price of involving user space.
+
+`scripts/boot-bench.sh` boots the same kernel repeatedly under tvm and, if it is installed, QEMU's `microvm` machine, and prints the minimum, median and maximum wall-clock time.
+
+Inside WSL2 every exit passes through a second hypervisor, which makes exits several times more expensive than on bare-metal Linux. Compare VMMs on the same host, and take absolute numbers on bare metal.
+
+## Tests
+
+```sh
+cargo test
+```
+
+Tests that need KVM skip themselves when `/dev/kvm` is missing. Tests that boot a real kernel are opt-in:
 
 ```sh
 VMM_TEST_KERNEL=$PWD/guest/vmlinuz-virt \
@@ -68,12 +110,3 @@ VMM_TEST_INITRD=$PWD/guest/initramfs-virt cargo test
 ```
 
 This boots the kernel twice: once with no root filesystem, and once to a shell that is sent a command and a reboot.
-
-## Progress
-
-- [x] Day 1 — VM, guest memory, one vCPU, real-mode stub, PIO and HLT exits
-- [x] Day 2 — 64-bit long mode: boot GDT, identity-mapped page tables, CPUID, register setup
-- [x] Day 3 — load a bzImage via the Linux boot protocol; in-kernel PIC/IOAPIC/LAPIC/PIT
-- [x] Day 4 — 16550A UART on COM1 with interrupts; the kernel's 8250 driver detects and uses it
-- [x] Day 5 — initrd loading, console input, interactive shell
-- [ ] Day 6 — exit and boot-time instrumentation, baselines

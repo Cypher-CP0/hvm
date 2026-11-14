@@ -9,3 +9,4 @@ description = "The VMM binary: guest memory, device model and vCPU run loop"
 hypervisor = { path = "../hypervisor" }
 thiserror.workspace = true
 vm-memory = { version = "0.18", features = ["backend-mmap"] }
+linux-loader = { version = "0.14", default-features = false, features = ["bzimage"] }

@@ -1,32 +1,119 @@
-//! Day 2: enter 64-bit long mode directly and run a small 64-bit program.
+//! Day 3: load a Linux bzImage and start it through the 64-bit boot protocol.
 
 mod arch;
 mod guest;
+mod platform;
 
 use std::error::Error;
+use std::fs::File;
 use std::io::Write;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use hypervisor::{ExitKind, Hypervisor, Vcpu, Vm, VmExit};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
-use arch::x86_64::layout::HIMEM_START;
+use arch::x86_64::layout::{HIMEM_START, MAX_MEM_SIZE};
+use arch::x86_64::{linux, regs};
+use platform::{Access, PioOutcome, Platform};
 
-/// Anonymous memory is allocated lazily, so this costs only what the guest
-/// actually touches.
-const GUEST_MEM_SIZE: usize = 128 << 20;
-const COM1: u16 = 0x3f8;
+const DEFAULT_MEM_MIB: u64 = 512;
+/// The built-in test guest writes at 64 MiB.
+const MIN_MEM_MIB: u64 = 128;
+
+/// - `earlyprintk=serial,ttyS0,115200`: log to COM1 from the first line of
+///   boot, before any driver is up.
+/// - `console=ttyS0`: the 8250 console driver then takes over. It only needs
+///   "transmitter ready" and "write a byte", which the port stub provides;
+///   the full device model arrives on Day 4.
+/// - `nokaslr`: load at the same address every boot.
+/// - `reboot=k panic=-1`: with no root filesystem yet the kernel panics at
+///   the end of boot; make it reset through the keyboard controller straight
+///   away, which the VMM treats as "stop".
+/// - `pci=off`: there is no PCI bus to probe.
+const DEFAULT_CMDLINE: &str =
+    "earlyprintk=serial,ttyS0,115200 console=ttyS0 nokaslr reboot=k panic=-1 pci=off";
+
+const USAGE: &str = "\
+usage: vmm [options]
+
+With no --kernel, runs a built-in 64-bit test guest.
+
+options:
+  --kernel <path>    Linux bzImage to boot
+  --cmdline <str>    kernel command line (replaces the default)
+  --mem <MiB>        guest memory size (default 512)
+  -h, --help         show this help";
+
+struct Config {
+    mem_mib: u64,
+    kernel: Option<String>,
+    cmdline: String,
+}
+
+impl Config {
+    fn parse(mut args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
+        let mut cfg = Config {
+            mem_mib: DEFAULT_MEM_MIB,
+            kernel: None,
+            cmdline: DEFAULT_CMDLINE.to_string(),
+        };
+        while let Some(arg) = args.next() {
+            let mut value = |name: &str| args.next().ok_or(format!("{name} needs a value"));
+            match arg.as_str() {
+                "--kernel" => cfg.kernel = Some(value("--kernel")?),
+                "--cmdline" => cfg.cmdline = value("--cmdline")?,
+                "--mem" => {
+                    let v = value("--mem")?;
+                    cfg.mem_mib = v
+                        .parse()
+                        .map_err(|_| format!("--mem: '{v}' is not a number of MiB"))?;
+                }
+                "-h" | "--help" => return Ok(None),
+                other => return Err(format!("unknown argument '{other}'")),
+            }
+        }
+        let max_mib = MAX_MEM_SIZE >> 20;
+        if !(MIN_MEM_MIB..=max_mib).contains(&cfg.mem_mib) {
+            return Err(format!(
+                "--mem must be between {MIN_MEM_MIB} and {max_mib} MiB"
+            ));
+        }
+        Ok(Some(cfg))
+    }
+}
+
+/// What to run in the guest.
+enum Payload<'a> {
+    /// Raw 64-bit code, loaded at 1 MiB. No interrupt controllers, so the
+    /// guest ends by executing HLT.
+    Raw(&'a [u8]),
+    /// A Linux bzImage, booted on the full platform.
+    Linux {
+        image: &'a mut File,
+        cmdline: &'a str,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopReason {
+    Halted,
+    Reset,
+}
 
 #[derive(Default)]
-struct ExitStats([u64; ExitKind::COUNT]);
+struct ExitStats {
+    counts: [u64; ExitKind::COUNT],
+    run_time: Duration,
+}
 
 impl ExitStats {
     fn record(&mut self, kind: ExitKind) {
-        self.0[kind as usize] += 1;
+        self.counts[kind as usize] += 1;
     }
 
     fn count(&self, kind: ExitKind) -> u64 {
-        self.0[kind as usize]
+        self.counts[kind as usize]
     }
 
     fn report(&self) {
@@ -37,7 +124,26 @@ impl ExitStats {
                 eprintln!("{kind:<12} {n}");
             }
         }
-        eprintln!("{:<12} {}", "total", self.0.iter().sum::<u64>());
+        eprintln!("{:<12} {}", "total", self.counts.iter().sum::<u64>());
+        eprintln!("{:<12} {:.3}s", "run time", self.run_time.as_secs_f64());
+    }
+}
+
+fn report_unhandled<W: Write>(platform: &Platform<W>) {
+    const SHOWN: usize = 12;
+    let unhandled = platform.unhandled();
+    if unhandled.is_empty() {
+        return;
+    }
+    eprintln!("--- unhandled i/o (top {SHOWN} of {}) ---", unhandled.len());
+    for (access, addr, count) in unhandled.into_iter().take(SHOWN) {
+        let name = match access {
+            Access::PioRead => "pio read",
+            Access::PioWrite => "pio write",
+            Access::MmioRead => "mmio read",
+            Access::MmioWrite => "mmio write",
+        };
+        eprintln!("{name:<12} {addr:#8x}  x{count}");
     }
 }
 
@@ -46,8 +152,8 @@ fn dump_state<V: Vcpu>(vcpu: &V) {
     eprintln!("--- vcpu state ---");
     match vcpu.get_regs() {
         Ok(r) => eprintln!(
-            "rip {:#018x} rsp {:#018x} rflags {:#x}\nrax {:#018x} rbx {:#018x} rcx {:#018x} rdx {:#018x}",
-            r.rip, r.rsp, r.rflags, r.rax, r.rbx, r.rcx, r.rdx
+            "rip {:#018x} rsp {:#018x} rflags {:#x}\nrax {:#018x} rbx {:#018x} rcx {:#018x} rdx {:#018x}\nrsi {:#018x} rdi {:#018x}",
+            r.rip, r.rsp, r.rflags, r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi
         ),
         Err(e) => eprintln!("cannot read regs: {e}"),
     }
@@ -61,18 +167,20 @@ fn dump_state<V: Vcpu>(vcpu: &V) {
     }
 }
 
-/// Load `image` at 1 MiB, start one vCPU there in long mode, and run it until
-/// it halts. Bytes the guest writes to COM1 go to `serial`.
-fn run_guest<H: Hypervisor>(
+/// Build a VM with `mem_size` bytes of RAM, start one vCPU on `payload` in
+/// long mode, and run it until it stops. Bytes the guest writes to COM1 go
+/// to `serial`.
+fn run_vm<H: Hypervisor>(
     hv: &H,
-    image: &[u8],
+    mem_size: u64,
+    payload: Payload<'_>,
     serial: &mut impl Write,
-) -> Result<ExitStats, Box<dyn Error>> {
-    // Guest RAM: one anonymous mmap region at guest physical address 0.
-    // Declared before the VM so it is dropped after it: the mapping must
-    // outlive every guest entry.
+) -> Result<(StopReason, ExitStats), Box<dyn Error>> {
+    // Guest RAM: one anonymous mmap region at guest physical address 0,
+    // allocated lazily by the host. Declared before the VM so it is dropped
+    // after it: the mapping must outlive every guest entry.
     let mem: GuestMemoryMmap<()> =
-        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), GUEST_MEM_SIZE)])?;
+        GuestMemoryMmap::from_ranges(&[(GuestAddress(0), mem_size as usize)])?;
 
     let vm = hv.create_vm()?;
     for (slot, region) in mem.iter().enumerate() {
@@ -86,65 +194,110 @@ fn run_guest<H: Hypervisor>(
             )?;
         }
     }
-    mem.write_slice(image, GuestAddress(HIMEM_START))?;
 
-    let mut vcpu = vm.create_vcpu(0)?;
-    arch::x86_64::regs::setup_long_mode(&mut vcpu, &mem, HIMEM_START)?;
+    let mut vcpu = match payload {
+        Payload::Raw(code) => {
+            mem.write_slice(code, GuestAddress(HIMEM_START))?;
+            let mut vcpu = vm.create_vcpu(0)?;
+            regs::setup_long_mode(&mut vcpu, &mem, HIMEM_START, 0)?;
+            vcpu
+        }
+        Payload::Linux { image, cmdline } => {
+            let kernel = linux::load_kernel(&mem, mem_size, image, cmdline)?;
+            eprintln!(
+                "kernel loaded at {HIMEM_START:#x}..{:#x}, entry {:#x}",
+                kernel.image_end, kernel.entry
+            );
+            // Interrupt controllers must exist before the vCPU does.
+            vm.init_platform()?;
+            let mut vcpu = vm.create_vcpu(0)?;
+            regs::setup_long_mode(&mut vcpu, &mem, kernel.entry, kernel.boot_params)?;
+            regs::setup_lapic(&mut vcpu)?;
+            vcpu
+        }
+    };
 
+    let mut platform = Platform::new(serial);
     let mut stats = ExitStats::default();
-    loop {
+    let started = Instant::now();
+    let result = loop {
         let exit = match vcpu.run() {
             Ok(exit) => exit,
             Err(e) => {
                 dump_state(&vcpu);
-                return Err(e.into());
+                break Err(e.into());
             }
         };
         stats.record(exit.kind());
         match exit {
-            VmExit::IoOut { port: COM1, data } => serial.write_all(data)?,
-            VmExit::IoOut { port, data } => {
-                eprintln!("unhandled pio write: port {port:#x} data {data:x?}")
-            }
-            VmExit::IoIn { port, data } => {
-                eprintln!("unhandled pio read: port {port:#x}");
-                data.fill(0xff); // floating bus
-            }
-            VmExit::MmioWrite { addr, data } => {
-                eprintln!("unhandled mmio write: addr {addr:#x} data {data:x?}")
-            }
-            VmExit::MmioRead { addr, data } => {
-                eprintln!("unhandled mmio read: addr {addr:#x}");
-                data.fill(0xff);
-            }
-            VmExit::Interrupted => continue,
-            VmExit::Hlt => break,
+            VmExit::IoOut { port, data } => match platform.pio_write(port, data) {
+                Ok(PioOutcome::Continue) => {}
+                Ok(PioOutcome::Reset) => break Ok(StopReason::Reset),
+                Err(e) => break Err(e.into()),
+            },
+            VmExit::IoIn { port, data } => platform.pio_read(port, data),
+            VmExit::MmioWrite { addr, .. } => platform.mmio_write(addr),
+            VmExit::MmioRead { addr, data } => platform.mmio_read(addr, data),
+            VmExit::Interrupted => {}
+            VmExit::Hlt => break Ok(StopReason::Halted),
             VmExit::Shutdown => {
                 dump_state(&vcpu);
-                return Err("guest shut down unexpectedly (triple fault?)".into());
+                break Err("guest shut down unexpectedly (triple fault?)".into());
             }
         }
-    }
-    serial.flush()?;
-    Ok(stats)
+    };
+    stats.run_time = started.elapsed();
+    platform.flush()?;
+    report_unhandled(&platform);
+    result.map(|reason| (reason, stats))
 }
 
 #[cfg(target_os = "linux")]
-fn main() -> ExitCode {
-    let hv = match hypervisor::kvm::KvmHypervisor::new() {
-        Ok(hv) => hv,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
+fn run(cfg: &Config) -> Result<(), Box<dyn Error>> {
+    let hv = hypervisor::kvm::KvmHypervisor::new()?;
+    eprintln!("kvm api version {}", hv.api_version());
+
+    let mem_size = cfg.mem_mib << 20;
+    let mut stdout = std::io::stdout().lock();
+    let (reason, stats) = match &cfg.kernel {
+        None => run_vm(&hv, mem_size, Payload::Raw(&guest::HELLO64), &mut stdout)?,
+        Some(path) => {
+            let mut image =
+                File::open(path).map_err(|e| format!("cannot open kernel '{path}': {e}"))?;
+            let payload = Payload::Linux {
+                image: &mut image,
+                cmdline: &cfg.cmdline,
+            };
+            run_vm(&hv, mem_size, payload, &mut stdout)?
         }
     };
-    eprintln!("kvm api version {}", hv.api_version());
-    match run_guest(&hv, &guest::HELLO64, &mut std::io::stdout().lock()) {
-        Ok(stats) => {
-            eprintln!("guest halted");
-            stats.report();
-            ExitCode::SUCCESS
+    match reason {
+        StopReason::Halted => eprintln!("guest halted"),
+        StopReason::Reset => eprintln!("guest requested reset"),
+    }
+    stats.report();
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run(_cfg: &Config) -> Result<(), Box<dyn Error>> {
+    Err("no hypervisor backend for this OS yet; build and run inside WSL2 or Linux".into())
+}
+
+fn main() -> ExitCode {
+    let cfg = match Config::parse(std::env::args().skip(1)) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
         }
+        Err(e) => {
+            eprintln!("error: {e}\n\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    match run(&cfg) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -152,31 +305,93 @@ fn main() -> ExitCode {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn main() -> ExitCode {
-    eprintln!("no hypervisor backend for this OS yet; build and run inside WSL2 or Linux");
-    ExitCode::FAILURE
-}
-
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    /// End-to-end: needs /dev/kvm, so it skips itself where there is none.
-    #[test]
-    fn long_mode_guest_prints_and_halts() {
-        let Ok(hv) = hypervisor::kvm::KvmHypervisor::new() else {
-            eprintln!("skipping: /dev/kvm is not available");
-            return;
-        };
-        let mut serial = Vec::new();
-        let stats = run_guest(&hv, &guest::HELLO64, &mut serial).unwrap();
+    fn parse(args: &[&str]) -> Result<Option<Config>, String> {
+        Config::parse(args.iter().map(|s| s.to_string()))
+    }
 
-        assert_eq!(serial, guest::HELLO64_OUTPUT);
-        assert_eq!(
-            stats.count(ExitKind::IoOut),
-            guest::HELLO64_OUTPUT.len() as u64
-        );
-        assert_eq!(stats.count(ExitKind::Hlt), 1);
+    #[test]
+    fn config_defaults_and_overrides() {
+        let cfg = parse(&[]).unwrap().unwrap();
+        assert_eq!(cfg.mem_mib, DEFAULT_MEM_MIB);
+        assert!(cfg.kernel.is_none());
+        assert_eq!(cfg.cmdline, DEFAULT_CMDLINE);
+
+        let cfg = parse(&["--kernel", "bzImage", "--mem", "256", "--cmdline", "quiet"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.kernel.as_deref(), Some("bzImage"));
+        assert_eq!(cfg.mem_mib, 256);
+        assert_eq!(cfg.cmdline, "quiet");
+    }
+
+    #[test]
+    fn config_rejects_bad_input() {
+        assert!(parse(&["--help"]).unwrap().is_none());
+        assert!(parse(&["--kernel"]).is_err());
+        assert!(parse(&["--mem", "lots"]).is_err());
+        assert!(parse(&["--mem", "16"]).is_err());
+        assert!(parse(&["--mem", "4096"]).is_err());
+        assert!(parse(&["--bogus"]).is_err());
+    }
+
+    /// End-to-end tests need /dev/kvm, so they skip themselves without it.
+    #[cfg(target_os = "linux")]
+    mod kvm {
+        use super::super::*;
+
+        fn hypervisor() -> Option<hypervisor::kvm::KvmHypervisor> {
+            let hv = hypervisor::kvm::KvmHypervisor::new().ok();
+            if hv.is_none() {
+                eprintln!("skipping: /dev/kvm is not available");
+            }
+            hv
+        }
+
+        #[test]
+        fn long_mode_guest_prints_and_halts() {
+            let Some(hv) = hypervisor() else { return };
+            let mut serial = Vec::new();
+            let (reason, stats) = run_vm(
+                &hv,
+                MIN_MEM_MIB << 20,
+                Payload::Raw(&guest::HELLO64),
+                &mut serial,
+            )
+            .unwrap();
+
+            assert_eq!(reason, StopReason::Halted);
+            assert_eq!(serial, guest::HELLO64_OUTPUT);
+            assert_eq!(
+                stats.count(ExitKind::IoOut),
+                guest::HELLO64_OUTPUT.len() as u64
+            );
+            assert_eq!(stats.count(ExitKind::Hlt), 1);
+        }
+
+        /// Boots a real kernel. Opt in with
+        /// `VMM_TEST_KERNEL=/path/to/bzImage cargo test`.
+        #[test]
+        fn linux_kernel_boots_to_panic_and_resets() {
+            let Ok(path) = std::env::var("VMM_TEST_KERNEL") else {
+                eprintln!("skipping: VMM_TEST_KERNEL is not set");
+                return;
+            };
+            let Some(hv) = hypervisor() else { return };
+            let mut image = File::open(&path).unwrap();
+            let mut serial = Vec::new();
+            let payload = Payload::Linux {
+                image: &mut image,
+                cmdline: DEFAULT_CMDLINE,
+            };
+            let (reason, _) = run_vm(&hv, DEFAULT_MEM_MIB << 20, payload, &mut serial).unwrap();
+
+            let log = String::from_utf8_lossy(&serial);
+            assert!(log.contains("Linux version"), "no kernel banner in:\n{log}");
+            assert_eq!(reason, StopReason::Reset);
+        }
     }
 }

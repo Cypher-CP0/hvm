@@ -7,9 +7,12 @@ use super::layout::{BOOT_GDT_ADDR, BOOT_IDT_ADDR};
 use super::Result;
 
 /// GDT indices. Selector = index * 8.
-const CODE_INDEX: u16 = 1;
-const DATA_INDEX: u16 = 2;
-const TSS_INDEX: u16 = 3;
+///
+/// The Linux 64-bit boot protocol requires CS = `__BOOT_CS` (0x10) and
+/// DS/ES/SS = `__BOOT_DS` (0x18), so entry 1 is left unused.
+const CODE_INDEX: u16 = 2;
+const DATA_INDEX: u16 = 3;
+const TSS_INDEX: u16 = 4;
 
 /// Encode a segment descriptor.
 ///
@@ -23,8 +26,9 @@ const fn gdt_entry(flags: u16, base: u32, limit: u32) -> u64 {
         | (limit as u64 & 0xffff)
 }
 
-const BOOT_GDT: [u64; 4] = [
+const BOOT_GDT: [u64; 5] = [
     gdt_entry(0, 0, 0),            // null
+    gdt_entry(0, 0, 0),            // unused
     gdt_entry(0xa09b, 0, 0xfffff), // 64-bit code: G, L, P, S, execute/read, accessed
     gdt_entry(0xc093, 0, 0xfffff), // data: G, DB, P, S, read/write, accessed
     gdt_entry(0x808b, 0, 0xfffff), // TSS: G, P, 64-bit TSS (busy)
@@ -95,9 +99,16 @@ mod tests {
     #[test]
     fn entries_encode_to_known_values() {
         assert_eq!(BOOT_GDT[0], 0);
-        assert_eq!(BOOT_GDT[1], 0x00af_9b00_0000_ffff);
-        assert_eq!(BOOT_GDT[2], 0x00cf_9300_0000_ffff);
-        assert_eq!(BOOT_GDT[3], 0x008f_8b00_0000_ffff);
+        assert_eq!(BOOT_GDT[1], 0);
+        assert_eq!(BOOT_GDT[2], 0x00af_9b00_0000_ffff);
+        assert_eq!(BOOT_GDT[3], 0x00cf_9300_0000_ffff);
+        assert_eq!(BOOT_GDT[4], 0x008f_8b00_0000_ffff);
+    }
+
+    #[test]
+    fn tables_do_not_overlap() {
+        let gdt_end = BOOT_GDT_ADDR + std::mem::size_of_val(&BOOT_GDT) as u64;
+        assert!(gdt_end <= BOOT_IDT_ADDR);
     }
 
     #[test]
@@ -110,8 +121,8 @@ mod tests {
 
     #[test]
     fn code_segment_is_64_bit() {
-        let cs = segment_from_gdt(BOOT_GDT[1], 1);
-        assert_eq!(cs.selector, 0x08);
+        let cs = segment_from_gdt(BOOT_GDT[CODE_INDEX as usize], CODE_INDEX);
+        assert_eq!(cs.selector, 0x10); // __BOOT_CS
         assert_eq!(cs.type_, 0xb);
         assert!(cs.l && !cs.db && cs.s && cs.present && cs.g);
         assert_eq!(cs.limit, 0xffff_ffff);
@@ -120,13 +131,13 @@ mod tests {
 
     #[test]
     fn data_and_tss_segments() {
-        let ds = segment_from_gdt(BOOT_GDT[2], 2);
-        assert_eq!(ds.selector, 0x10);
+        let ds = segment_from_gdt(BOOT_GDT[DATA_INDEX as usize], DATA_INDEX);
+        assert_eq!(ds.selector, 0x18); // __BOOT_DS
         assert_eq!(ds.type_, 0x3);
         assert!(ds.db && !ds.l && ds.s && ds.present);
 
-        let tr = segment_from_gdt(BOOT_GDT[3], 3);
-        assert_eq!(tr.selector, 0x18);
+        let tr = segment_from_gdt(BOOT_GDT[TSS_INDEX as usize], TSS_INDEX);
+        assert_eq!(tr.selector, 0x20);
         assert_eq!(tr.type_, 0xb);
         assert!(!tr.s && tr.present);
     }

@@ -1,16 +1,28 @@
 //! KVM backend.
 
 use kvm_bindings::{
-    kvm_dtable, kvm_regs, kvm_segment, kvm_userspace_memory_region, CpuId, KVM_MAX_CPUID_ENTRIES,
+    kvm_dtable, kvm_lapic_state, kvm_msr_entry, kvm_pit_config, kvm_regs, kvm_segment,
+    kvm_userspace_memory_region, CpuId, Msrs, KVM_MAX_CPUID_ENTRIES, KVM_PIT_SPEAKER_DUMMY,
 };
 use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 
-use crate::x86_64::{DescriptorTable, Segment, SpecialRegs, StandardRegs};
+use crate::x86_64::{
+    ApicDeliveryMode, DescriptorTable, FpuControl, Segment, SpecialRegs, StandardRegs,
+};
 use crate::{Error, Hypervisor, Result, Vcpu, VmExit};
 
 // Fixed on Linux x86-64; not worth a libc dependency.
 const EINTR: i32 = 4;
 const EAGAIN: i32 = 11;
+
+/// Three pages just below the BIOS area at the top of 4 GiB, where no guest
+/// RAM is ever mapped. Intel VT-x needs somewhere to keep a real-mode TSS.
+const TSS_ADDR: usize = 0xfffb_d000;
+
+/// Local APIC register offsets within the KVM_GET_LAPIC page.
+const APIC_LVT0: usize = 0x350;
+const APIC_LVT1: usize = 0x360;
+const APIC_LVT_DELIVERY_MODE_MASK: u32 = 0x700;
 
 fn backend(op: &'static str) -> impl FnOnce(kvm_ioctls::Error) -> Error {
     move |e| Error::Backend {
@@ -44,6 +56,8 @@ impl Hypervisor for KvmHypervisor {
 
     fn create_vm(&self) -> Result<KvmVm> {
         let fd = self.kvm.create_vm().map_err(backend("KVM_CREATE_VM"))?;
+        fd.set_tss_address(TSS_ADDR)
+            .map_err(backend("KVM_SET_TSS_ADDR"))?;
         let supported_cpuid = self
             .kvm
             .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
@@ -83,6 +97,19 @@ impl crate::Vm for KvmVm {
             .map_err(backend("KVM_SET_USER_MEMORY_REGION"))
     }
 
+    fn init_platform(&self) -> Result<()> {
+        self.fd
+            .create_irq_chip()
+            .map_err(backend("KVM_CREATE_IRQCHIP"))?;
+        let pit = kvm_pit_config {
+            // Emulate the PC speaker port (0x61) in the kernel as well, so
+            // the guest's PIT channel 2 calibration does not exit to us.
+            flags: KVM_PIT_SPEAKER_DUMMY,
+            ..Default::default()
+        };
+        self.fd.create_pit2(pit).map_err(backend("KVM_CREATE_PIT2"))
+    }
+
     fn create_vcpu(&self, id: u32) -> Result<KvmVcpu> {
         let fd = self
             .fd
@@ -90,6 +117,7 @@ impl crate::Vm for KvmVm {
             .map_err(backend("KVM_CREATE_VCPU"))?;
         Ok(KvmVcpu {
             fd,
+            id,
             supported_cpuid: self.supported_cpuid.clone(),
         })
     }
@@ -97,13 +125,30 @@ impl crate::Vm for KvmVm {
 
 pub struct KvmVcpu {
     fd: VcpuFd,
+    id: u32,
     supported_cpuid: CpuId,
 }
 
 impl Vcpu for KvmVcpu {
     fn init_cpuid(&mut self) -> Result<()> {
+        // KVM reports what the host can virtualise, but leaves the per-CPU
+        // identity fields as the host CPU's. Make them describe this vCPU.
+        let mut cpuid = self.supported_cpuid.clone();
+        for entry in cpuid.as_mut_slice() {
+            match entry.function {
+                0x1 => {
+                    // EBX[31:24]: initial APIC ID. ECX[31]: running under a
+                    // hypervisor.
+                    entry.ebx = (entry.ebx & 0x00ff_ffff) | (self.id << 24);
+                    entry.ecx |= 1 << 31;
+                }
+                // Extended topology leaves: EDX is the x2APIC ID.
+                0xb | 0x1f => entry.edx = self.id,
+                _ => {}
+            }
+        }
         self.fd
-            .set_cpuid2(&self.supported_cpuid)
+            .set_cpuid2(&cpuid)
             .map_err(backend("KVM_SET_CPUID2"))
     }
 
@@ -214,6 +259,44 @@ impl Vcpu for KvmVcpu {
         self.fd.set_sregs(&k).map_err(backend("KVM_SET_SREGS"))
     }
 
+    fn set_msrs(&mut self, msrs: &[(u32, u64)]) -> Result<()> {
+        let entries: Vec<kvm_msr_entry> = msrs
+            .iter()
+            .map(|&(index, data)| kvm_msr_entry {
+                index,
+                data,
+                ..Default::default()
+            })
+            .collect();
+        let wrapper = Msrs::from_entries(&entries).map_err(|_| Error::Backend {
+            op: "KVM_SET_MSRS",
+            source: std::io::Error::from_raw_os_error(7), // E2BIG
+        })?;
+        // KVM stops at the first MSR it refuses and returns how many it set.
+        let written = self
+            .fd
+            .set_msrs(&wrapper)
+            .map_err(backend("KVM_SET_MSRS"))?;
+        match msrs.get(written) {
+            Some(&(index, _)) => Err(Error::MsrRejected { index }),
+            None => Ok(()),
+        }
+    }
+
+    fn set_fpu_control(&mut self, fpu: FpuControl) -> Result<()> {
+        let mut k = self.fd.get_fpu().map_err(backend("KVM_GET_FPU"))?;
+        k.fcw = fpu.fcw;
+        k.mxcsr = fpu.mxcsr;
+        self.fd.set_fpu(&k).map_err(backend("KVM_SET_FPU"))
+    }
+
+    fn set_lapic_lint(&mut self, lint0: ApicDeliveryMode, lint1: ApicDeliveryMode) -> Result<()> {
+        let mut lapic = self.fd.get_lapic().map_err(backend("KVM_GET_LAPIC"))?;
+        set_lvt_delivery_mode(&mut lapic, APIC_LVT0, lint0);
+        set_lvt_delivery_mode(&mut lapic, APIC_LVT1, lint1);
+        self.fd.set_lapic(&lapic).map_err(backend("KVM_SET_LAPIC"))
+    }
+
     fn run(&mut self) -> Result<VmExit<'_>> {
         match self.fd.run() {
             Ok(VcpuExit::IoOut(port, data)) => Ok(VmExit::IoOut { port, data }),
@@ -262,5 +345,48 @@ fn segment_to_kvm(s: &Segment) -> kvm_segment {
         avl: s.avl as u8,
         unusable: s.unusable as u8,
         padding: 0,
+    }
+}
+
+fn set_lvt_delivery_mode(lapic: &mut kvm_lapic_state, offset: usize, mode: ApicDeliveryMode) {
+    let mut bytes = [0u8; 4];
+    for (b, r) in bytes.iter_mut().zip(&lapic.regs[offset..offset + 4]) {
+        *b = *r as u8;
+    }
+    let lvt = (u32::from_le_bytes(bytes) & !APIC_LVT_DELIVERY_MODE_MASK) | ((mode as u32) << 8);
+    for (r, b) in lapic.regs[offset..offset + 4]
+        .iter_mut()
+        .zip(lvt.to_le_bytes())
+    {
+        *r = b as _;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lvt_delivery_mode_is_replaced_and_other_bits_kept() {
+        let mut lapic = kvm_lapic_state::default();
+        // Masked (bit 16), fixed delivery, vector 0x31.
+        for (r, b) in lapic.regs[APIC_LVT0..APIC_LVT0 + 4]
+            .iter_mut()
+            .zip(0x0001_0031u32.to_le_bytes())
+        {
+            *r = b as _;
+        }
+        set_lvt_delivery_mode(&mut lapic, APIC_LVT0, ApicDeliveryMode::ExtInt);
+        set_lvt_delivery_mode(&mut lapic, APIC_LVT1, ApicDeliveryMode::Nmi);
+
+        let read = |off: usize| {
+            let mut b = [0u8; 4];
+            for (d, s) in b.iter_mut().zip(&lapic.regs[off..off + 4]) {
+                *d = *s as u8;
+            }
+            u32::from_le_bytes(b)
+        };
+        assert_eq!(read(APIC_LVT0), 0x0001_0731);
+        assert_eq!(read(APIC_LVT1), 0x0000_0400);
     }
 }

@@ -10,7 +10,7 @@ use std::fmt;
 pub mod kvm;
 pub mod x86_64;
 
-use x86_64::{SpecialRegs, StandardRegs};
+use x86_64::{ApicDeliveryMode, FpuControl, SpecialRegs, StandardRegs};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -24,6 +24,8 @@ pub enum Error {
     },
     #[error("vCPU entry failed (hardware reason {reason:#x})")]
     FailEntry { reason: u64 },
+    #[error("the hypervisor rejected MSR {index:#x}")]
+    MsrRejected { index: u32 },
     #[error("unsupported vCPU exit: {0}")]
     UnsupportedExit(String),
 }
@@ -139,6 +141,14 @@ pub trait Vm {
         size: u64,
     ) -> Result<()>;
 
+    /// Create the interrupt controllers and timer that the hypervisor
+    /// emulates itself: PIC, IOAPIC, PIT and a local APIC per vCPU.
+    ///
+    /// Must be called before any vCPU is created. Once it has been, a guest
+    /// HLT is handled inside the hypervisor and no longer produces
+    /// [`VmExit::Hlt`].
+    fn init_platform(&self) -> Result<()>;
+
     fn create_vcpu(&self, id: u32) -> Result<Self::Vcpu>;
 }
 
@@ -156,6 +166,15 @@ pub trait Vcpu {
     /// Set the special registers. State not covered by [`SpecialRegs`]
     /// (APIC base, pending interrupts) is left untouched.
     fn set_sregs(&mut self, sregs: &SpecialRegs) -> Result<()>;
+
+    /// Write model-specific registers, given as `(index, value)` pairs.
+    fn set_msrs(&mut self, msrs: &[(u32, u64)]) -> Result<()>;
+
+    fn set_fpu_control(&mut self, fpu: FpuControl) -> Result<()>;
+
+    /// Set the delivery mode of the local APIC's LINT0 and LINT1 pins.
+    /// Requires [`Vm::init_platform`].
+    fn set_lapic_lint(&mut self, lint0: ApicDeliveryMode, lint1: ApicDeliveryMode) -> Result<()>;
 
     /// Enter the guest and block until it exits.
     fn run(&mut self) -> Result<VmExit<'_>>;

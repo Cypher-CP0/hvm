@@ -79,3 +79,22 @@ pub const CR0_PG: u64 = 1 << 31;
 pub const CR4_PAE: u64 = 1 << 5;
 pub const EFER_LME: u64 = 1 << 8;
 pub const EFER_LMA: u64 = 1 << 10;
+
+/// How a local APIC LINT pin delivers its interrupt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ApicDeliveryMode {
+    Fixed = 0b000,
+    Nmi = 0b100,
+    /// The pin is wired to an 8259 PIC, which supplies the vector.
+    ExtInt = 0b111,
+}
+
+/// Floating-point control state that matters at boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FpuControl {
+    /// x87 control word.
+    pub fcw: u16,
+    /// SSE control/status register.
+    pub mxcsr: u32,
+}

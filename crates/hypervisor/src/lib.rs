@@ -126,6 +126,7 @@ pub trait Hypervisor {
 /// A virtual machine: an address space plus a set of vCPUs.
 pub trait Vm {
     type Vcpu: Vcpu;
+    type IrqLine: IrqLine;
 
     /// Map `size` bytes of host memory at `host_addr` into the guest physical
     /// address space at `guest_addr`.
@@ -149,11 +150,19 @@ pub trait Vm {
     /// [`VmExit::Hlt`].
     fn init_platform(&self) -> Result<()>;
 
-    /// Drive an interrupt line of the emulated interrupt controllers high or
-    /// low. Lines 0-15 are the ISA IRQs. Requires [`Vm::init_platform`].
-    fn set_irq_line(&self, irq: u32, level: bool) -> Result<()>;
+    /// A handle for one interrupt line of the emulated interrupt
+    /// controllers. Lines 0-15 are the ISA IRQs. Requires
+    /// [`Vm::init_platform`].
+    fn irq_line(&self, irq: u32) -> Result<Self::IrqLine>;
 
     fn create_vcpu(&self, id: u32) -> Result<Self::Vcpu>;
+}
+
+/// One interrupt line into the guest. Devices hold these and may drive them
+/// from any thread.
+pub trait IrqLine: Send + 'static {
+    /// Drive the line high or low.
+    fn set_level(&self, level: bool) -> Result<()>;
 }
 
 /// A virtual CPU. Owned and driven by exactly one host thread.

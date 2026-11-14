@@ -6,6 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+
+use hypervisor::IrqLine;
 
 use crate::devices::serial::Serial;
 
@@ -38,25 +41,82 @@ pub enum Access {
     MmioWrite,
 }
 
+/// COM1: the UART together with its interrupt line.
+///
+/// Shared between the vCPU thread, which handles the guest's port accesses,
+/// and the console input thread, which delivers received bytes.
+pub struct Com1<W> {
+    uart: Serial<W>,
+    /// `None` when the VM has no interrupt controller to deliver to.
+    irq: Option<Box<dyn IrqLine>>,
+    /// The level the line was last driven to.
+    asserted: bool,
+}
+
+impl<W: Write> Com1<W> {
+    /// Bring the interrupt line in step with the UART. Must follow every
+    /// operation that can change the UART's interrupt state.
+    fn sync_irq(&mut self) -> io::Result<()> {
+        let level = self.uart.interrupt_pending();
+        if level != self.asserted {
+            if let Some(irq) = &self.irq {
+                irq.set_level(level).map_err(io::Error::other)?;
+            }
+            self.asserted = level;
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, offset: u8) -> io::Result<u8> {
+        let value = self.uart.read(offset);
+        self.sync_irq()?;
+        Ok(value)
+    }
+
+    fn write(&mut self, offset: u8, value: u8) -> io::Result<()> {
+        self.uart.write(offset, value)?;
+        self.sync_irq()
+    }
+
+    /// Deliver bytes from the outside world to the guest. Returns how many
+    /// the UART had room for.
+    pub fn receive(&mut self, data: &[u8]) -> io::Result<usize> {
+        let accepted = self.uart.enqueue_rx(data);
+        self.sync_irq()?;
+        Ok(accepted)
+    }
+
+    /// Whether the interrupt line is currently driven high.
+    #[cfg(test)]
+    pub fn interrupt_asserted(&self) -> bool {
+        self.asserted
+    }
+}
+
 pub struct Platform<W> {
-    com1: Serial<W>,
+    com1: Arc<Mutex<Com1<W>>>,
     /// Accesses nothing claimed, by address. Reported at exit so that we can
     /// see what the guest probes for.
     unhandled: BTreeMap<(Access, u64), u64>,
 }
 
 impl<W: Write> Platform<W> {
-    pub fn new(serial: W) -> Self {
+    /// `serial` receives what the guest transmits on COM1; `com1_irq` is the
+    /// line the UART interrupts on.
+    pub fn new(serial: W, com1_irq: Option<Box<dyn IrqLine>>) -> Self {
         Self {
-            com1: Serial::new(serial),
+            com1: Arc::new(Mutex::new(Com1 {
+                uart: Serial::new(serial),
+                irq: com1_irq,
+                asserted: false,
+            })),
             unhandled: BTreeMap::new(),
         }
     }
 
-    /// Whether COM1 is asserting its interrupt line. The owner mirrors this
-    /// onto [`COM1_IRQ`] after every port access.
-    pub fn com1_interrupt(&self) -> bool {
-        self.com1.interrupt_pending()
+    /// A handle to COM1 for whoever supplies its input.
+    pub fn com1(&self) -> Arc<Mutex<Com1<W>>> {
+        Arc::clone(&self.com1)
     }
 
     pub fn pio_write(&mut self, port: u16, data: &[u8]) -> io::Result<PioOutcome> {
@@ -64,8 +124,9 @@ impl<W: Write> Platform<W> {
             COM1_BASE..=COM1_END => {
                 // More than one byte means string I/O (`rep outsb`): each
                 // byte is a separate write to the same register.
+                let mut com1 = self.com1.lock().unwrap();
                 for &byte in data {
-                    self.com1.write((port - COM1_BASE) as u8, byte)?;
+                    com1.write((port - COM1_BASE) as u8, byte)?;
                 }
             }
             I8042_COMMAND if data.first() == Some(&I8042_CMD_RESET) => {
@@ -77,13 +138,14 @@ impl<W: Write> Platform<W> {
         Ok(PioOutcome::Continue)
     }
 
-    pub fn pio_read(&mut self, port: u16, data: &mut [u8]) {
+    pub fn pio_read(&mut self, port: u16, data: &mut [u8]) -> io::Result<()> {
         let value = match port {
             COM1_BASE..=COM1_END => {
+                let mut com1 = self.com1.lock().unwrap();
                 for byte in data.iter_mut() {
-                    *byte = self.com1.read((port - COM1_BASE) as u8);
+                    *byte = com1.read((port - COM1_BASE) as u8)?;
                 }
-                return;
+                return Ok(());
             }
             // Keyboard controller: both buffers empty.
             I8042_DATA | I8042_COMMAND => 0,
@@ -96,6 +158,7 @@ impl<W: Write> Platform<W> {
             }
         };
         data.fill(value);
+        Ok(())
     }
 
     pub fn mmio_write(&mut self, addr: u64) {
@@ -108,7 +171,7 @@ impl<W: Write> Platform<W> {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        self.com1.flush()
+        self.com1.lock().unwrap().uart.flush()
     }
 
     fn note_unhandled(&mut self, access: Access, addr: u64) {
@@ -129,39 +192,78 @@ impl<W: Write> Platform<W> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    /// An interrupt line that records its level.
+    struct TestLine(Arc<AtomicBool>);
+
+    impl IrqLine for TestLine {
+        fn set_level(&self, level: bool) -> hypervisor::Result<()> {
+            self.0.store(level, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn platform() -> Platform<Vec<u8>> {
+        Platform::new(Vec::new(), None)
+    }
 
     fn read<W: Write>(p: &mut Platform<W>, port: u16) -> u8 {
         let mut b = [0xaa];
-        p.pio_read(port, &mut b);
+        p.pio_read(port, &mut b).unwrap();
         b[0]
     }
 
     #[test]
     fn com1_ports_reach_the_uart() {
-        let mut out = Vec::new();
-        {
-            let mut p = Platform::new(&mut out);
-            assert_eq!(read(&mut p, COM1_BASE + 5) & 0x20, 0x20, "LSR: THR empty");
-            p.pio_write(COM1_BASE, b"o").unwrap();
-            // String I/O delivers several bytes for one port.
-            p.pio_write(COM1_BASE, b"k\n").unwrap();
-            assert!(p.unhandled().is_empty());
+        let mut p = platform();
+        assert_eq!(read(&mut p, COM1_BASE + 5) & 0x20, 0x20, "LSR: THR empty");
+        p.pio_write(COM1_BASE, b"o").unwrap();
+        // String I/O delivers several bytes for one port.
+        p.pio_write(COM1_BASE, b"k\n").unwrap();
+        assert!(p.unhandled().is_empty());
 
-            // Enabling the THR-empty interrupt raises the line; reading IIR
-            // acknowledges it.
-            assert!(!p.com1_interrupt());
-            p.pio_write(COM1_BASE + 1, &[0x02]).unwrap();
-            assert!(p.com1_interrupt());
-            assert_eq!(read(&mut p, COM1_BASE + 2), 0x02);
-            assert!(!p.com1_interrupt());
-        }
+        let mut out = Vec::new();
+        std::mem::swap(&mut out, p.com1.lock().unwrap().uart.output_mut());
         assert_eq!(out, b"ok\n");
     }
 
     #[test]
+    fn com1_interrupt_line_follows_the_uart() {
+        let level = Arc::new(AtomicBool::new(false));
+        let line = TestLine(Arc::clone(&level));
+        let mut p = Platform::new(Vec::new(), Some(Box::new(line)));
+        let asserted = || level.load(Ordering::SeqCst);
+
+        // Enabling the THR-empty interrupt raises the line; reading IIR
+        // acknowledges it.
+        p.pio_write(COM1_BASE + 1, &[0x02]).unwrap();
+        assert!(asserted());
+        assert_eq!(read(&mut p, COM1_BASE + 2), 0x02);
+        assert!(!asserted());
+
+        // Received data raises it from another thread's handle, and the
+        // guest reading the byte lowers it.
+        p.pio_write(COM1_BASE + 1, &[0x01]).unwrap();
+        let com1 = p.com1();
+        assert_eq!(com1.lock().unwrap().receive(b"a").unwrap(), 1);
+        assert!(asserted());
+        assert_eq!(read(&mut p, COM1_BASE), b'a');
+        assert!(!asserted());
+    }
+
+    #[test]
+    fn com1_works_without_an_interrupt_line() {
+        let mut p = platform();
+        p.pio_write(COM1_BASE + 1, &[0x02]).unwrap();
+        assert!(p.com1().lock().unwrap().interrupt_asserted());
+    }
+
+    #[test]
     fn keyboard_controller_reset_is_reported() {
-        let mut p = Platform::new(Vec::new());
+        let mut p = platform();
         assert_eq!(read(&mut p, I8042_COMMAND) & 0x02, 0, "input buffer empty");
         assert_eq!(
             p.pio_write(I8042_COMMAND, &[0xd1]).unwrap(),
@@ -175,7 +277,7 @@ mod tests {
 
     #[test]
     fn unknown_ports_float_high_and_are_counted() {
-        let mut p = Platform::new(Vec::new());
+        let mut p = platform();
         assert_eq!(read(&mut p, 0xcfc), 0xff);
         assert_eq!(read(&mut p, 0xcfc), 0xff);
         p.pio_write(0xcf8, &[0, 0, 0, 0x80]).unwrap();
@@ -188,7 +290,7 @@ mod tests {
 
     #[test]
     fn cmos_never_reports_update_in_progress() {
-        let mut p = Platform::new(Vec::new());
+        let mut p = platform();
         p.pio_write(CMOS_INDEX, &[0x0a]).unwrap();
         assert_eq!(read(&mut p, CMOS_DATA) & 0x80, 0);
     }

@@ -1,5 +1,7 @@
 //! KVM backend.
 
+use std::sync::Arc;
+
 use kvm_bindings::{
     kvm_dtable, kvm_lapic_state, kvm_msr_entry, kvm_pit_config, kvm_regs, kvm_segment,
     kvm_userspace_memory_region, CpuId, Msrs, KVM_MAX_CPUID_ENTRIES, KVM_PIT_SPEAKER_DUMMY,
@@ -9,7 +11,7 @@ use kvm_ioctls::{Kvm, VcpuExit, VcpuFd, VmFd};
 use crate::x86_64::{
     ApicDeliveryMode, DescriptorTable, FpuControl, Segment, SpecialRegs, StandardRegs,
 };
-use crate::{Error, Hypervisor, Result, Vcpu, VmExit};
+use crate::{Error, Hypervisor, IrqLine, Result, Vcpu, VmExit};
 
 // Fixed on Linux x86-64; not worth a libc dependency.
 const EINTR: i32 = 4;
@@ -63,19 +65,21 @@ impl Hypervisor for KvmHypervisor {
             .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
             .map_err(backend("KVM_GET_SUPPORTED_CPUID"))?;
         Ok(KvmVm {
-            fd,
+            fd: Arc::new(fd),
             supported_cpuid,
         })
     }
 }
 
 pub struct KvmVm {
-    fd: VmFd,
+    /// Shared with the interrupt lines handed out to devices.
+    fd: Arc<VmFd>,
     supported_cpuid: CpuId,
 }
 
 impl crate::Vm for KvmVm {
     type Vcpu = KvmVcpu;
+    type IrqLine = KvmIrqLine;
 
     unsafe fn map_memory(
         &self,
@@ -110,10 +114,11 @@ impl crate::Vm for KvmVm {
         self.fd.create_pit2(pit).map_err(backend("KVM_CREATE_PIT2"))
     }
 
-    fn set_irq_line(&self, irq: u32, level: bool) -> Result<()> {
-        self.fd
-            .set_irq_line(irq, level)
-            .map_err(backend("KVM_IRQ_LINE"))
+    fn irq_line(&self, irq: u32) -> Result<KvmIrqLine> {
+        Ok(KvmIrqLine {
+            vm: Arc::clone(&self.fd),
+            irq,
+        })
     }
 
     fn create_vcpu(&self, id: u32) -> Result<KvmVcpu> {
@@ -126,6 +131,19 @@ impl crate::Vm for KvmVm {
             id,
             supported_cpuid: self.supported_cpuid.clone(),
         })
+    }
+}
+
+pub struct KvmIrqLine {
+    vm: Arc<VmFd>,
+    irq: u32,
+}
+
+impl IrqLine for KvmIrqLine {
+    fn set_level(&self, level: bool) -> Result<()> {
+        self.vm
+            .set_irq_line(self.irq, level)
+            .map_err(backend("KVM_IRQ_LINE"))
     }
 }
 

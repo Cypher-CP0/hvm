@@ -130,6 +130,7 @@ name = "vmm"
 version = "0.1.0"
 dependencies = [
  "hypervisor",
+ "libc",
  "linux-loader",
  "thiserror",
  "vm-memory",

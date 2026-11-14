@@ -126,6 +126,11 @@ impl<W: Write> Serial<W> {
         self.out.flush()
     }
 
+    #[cfg(test)]
+    pub fn output_mut(&mut self) -> &mut W {
+        &mut self.out
+    }
+
     pub fn read(&mut self, offset: u8) -> u8 {
         match offset {
             DATA if self.dlab() => self.divisor as u8,

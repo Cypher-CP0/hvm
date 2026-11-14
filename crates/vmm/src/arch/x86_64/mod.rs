@@ -23,6 +23,10 @@ pub enum Error {
         "kernel needs {needed_mib} MiB of guest memory but only {available_mib} MiB is configured"
     )]
     NotEnoughMemory { needed_mib: u64, available_mib: u64 },
+    #[error("cannot read initrd: {0}")]
+    InitrdRead(#[source] std::io::Error),
+    #[error("initrd is too large for the boot protocol ({size} bytes)")]
+    InitrdTooLarge { size: u64 },
     #[error("invalid kernel command line: {0}")]
     Cmdline(#[from] linux_loader::cmdline::Error),
 }

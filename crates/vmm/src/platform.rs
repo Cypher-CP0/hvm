@@ -1,22 +1,18 @@
-//! Legacy PC port I/O, just enough for a kernel to get through early boot.
+//! The legacy PC platform: what lives at fixed I/O ports.
 //!
-//! This is a stopgap: the serial port becomes a real 8250 on Day 4 and the
-//! rest moves behind a proper device bus in week 2.
+//! COM1 is a real 16550A. The keyboard controller and CMOS are stubs that do
+//! just enough for a kernel to boot and reset; they move behind a proper
+//! device bus in week 2.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
+use crate::devices::serial::Serial;
+
 const COM1_BASE: u16 = 0x3f8;
 const COM1_END: u16 = 0x3ff;
-/// Transmit holding register, or divisor latch low byte while DLAB is set.
-const COM1_THR: u16 = COM1_BASE;
-/// Line control register; bit 7 is DLAB.
-const COM1_LCR: u16 = COM1_BASE + 3;
-/// Line status register.
-const COM1_LSR: u16 = COM1_BASE + 5;
-const LCR_DLAB: u8 = 0x80;
-/// Transmitter empty and idle: the guest may always send.
-const LSR_THRE_TEMT: u8 = 0x60;
+/// ISA interrupt line of COM1.
+pub const COM1_IRQ: u32 = 4;
 
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
@@ -43,8 +39,7 @@ pub enum Access {
 }
 
 pub struct Platform<W> {
-    serial: W,
-    com1_lcr: u8,
+    com1: Serial<W>,
     /// Accesses nothing claimed, by address. Reported at exit so that we can
     /// see what the guest probes for.
     unhandled: BTreeMap<(Access, u64), u64>,
@@ -53,21 +48,26 @@ pub struct Platform<W> {
 impl<W: Write> Platform<W> {
     pub fn new(serial: W) -> Self {
         Self {
-            serial,
-            com1_lcr: 0,
+            com1: Serial::new(serial),
             unhandled: BTreeMap::new(),
         }
     }
 
+    /// Whether COM1 is asserting its interrupt line. The owner mirrors this
+    /// onto [`COM1_IRQ`] after every port access.
+    pub fn com1_interrupt(&self) -> bool {
+        self.com1.interrupt_pending()
+    }
+
     pub fn pio_write(&mut self, port: u16, data: &[u8]) -> io::Result<PioOutcome> {
         match port {
-            COM1_BASE..=COM1_END => match port {
-                // With DLAB set this register is the baud-rate divisor, not
-                // a character to print.
-                COM1_THR if self.com1_lcr & LCR_DLAB == 0 => self.serial.write_all(data)?,
-                COM1_LCR => self.com1_lcr = data.first().copied().unwrap_or(0),
-                _ => {}
-            },
+            COM1_BASE..=COM1_END => {
+                // More than one byte means string I/O (`rep outsb`): each
+                // byte is a separate write to the same register.
+                for &byte in data {
+                    self.com1.write((port - COM1_BASE) as u8, byte)?;
+                }
+            }
             I8042_COMMAND if data.first() == Some(&I8042_CMD_RESET) => {
                 return Ok(PioOutcome::Reset)
             }
@@ -79,8 +79,12 @@ impl<W: Write> Platform<W> {
 
     pub fn pio_read(&mut self, port: u16, data: &mut [u8]) {
         let value = match port {
-            COM1_LSR => LSR_THRE_TEMT,
-            COM1_BASE..=COM1_END => 0,
+            COM1_BASE..=COM1_END => {
+                for byte in data.iter_mut() {
+                    *byte = self.com1.read((port - COM1_BASE) as u8);
+                }
+                return;
+            }
             // Keyboard controller: both buffers empty.
             I8042_DATA | I8042_COMMAND => 0,
             // No RTC. Zero keeps "update in progress" clear, so a guest
@@ -104,7 +108,7 @@ impl<W: Write> Platform<W> {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        self.serial.flush()
+        self.com1.flush()
     }
 
     fn note_unhandled(&mut self, access: Access, addr: u64) {
@@ -127,32 +131,32 @@ impl<W: Write> Platform<W> {
 mod tests {
     use super::*;
 
-    fn read(p: &mut Platform<Vec<u8>>, port: u16) -> u8 {
+    fn read<W: Write>(p: &mut Platform<W>, port: u16) -> u8 {
         let mut b = [0xaa];
         p.pio_read(port, &mut b);
         b[0]
     }
 
     #[test]
-    fn serial_output_skips_divisor_latch_writes() {
-        let mut p = Platform::new(Vec::new());
-        // What the kernel's early serial init does: set DLAB, program the
-        // divisor, clear DLAB, then print.
-        p.pio_write(COM1_LCR, &[0x83]).unwrap();
-        p.pio_write(COM1_THR, &[0x01]).unwrap();
-        p.pio_write(COM1_BASE + 1, &[0x00]).unwrap();
-        p.pio_write(COM1_LCR, &[0x03]).unwrap();
-        p.pio_write(COM1_THR, b"o").unwrap();
-        p.pio_write(COM1_THR, b"k").unwrap();
+    fn com1_ports_reach_the_uart() {
+        let mut out = Vec::new();
+        {
+            let mut p = Platform::new(&mut out);
+            assert_eq!(read(&mut p, COM1_BASE + 5) & 0x20, 0x20, "LSR: THR empty");
+            p.pio_write(COM1_BASE, b"o").unwrap();
+            // String I/O delivers several bytes for one port.
+            p.pio_write(COM1_BASE, b"k\n").unwrap();
+            assert!(p.unhandled().is_empty());
 
-        assert_eq!(p.serial, b"ok");
-        assert!(p.unhandled().is_empty());
-    }
-
-    #[test]
-    fn serial_always_reports_ready_to_transmit() {
-        let mut p = Platform::new(Vec::new());
-        assert_eq!(read(&mut p, COM1_LSR) & 0x20, 0x20);
+            // Enabling the THR-empty interrupt raises the line; reading IIR
+            // acknowledges it.
+            assert!(!p.com1_interrupt());
+            p.pio_write(COM1_BASE + 1, &[0x02]).unwrap();
+            assert!(p.com1_interrupt());
+            assert_eq!(read(&mut p, COM1_BASE + 2), 0x02);
+            assert!(!p.com1_interrupt());
+        }
+        assert_eq!(out, b"ok\n");
     }
 
     #[test]

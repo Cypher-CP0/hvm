@@ -110,6 +110,12 @@ impl crate::Vm for KvmVm {
         self.fd.create_pit2(pit).map_err(backend("KVM_CREATE_PIT2"))
     }
 
+    fn set_irq_line(&self, irq: u32, level: bool) -> Result<()> {
+        self.fd
+            .set_irq_line(irq, level)
+            .map_err(backend("KVM_IRQ_LINE"))
+    }
+
     fn create_vcpu(&self, id: u32) -> Result<KvmVcpu> {
         let fd = self
             .fd

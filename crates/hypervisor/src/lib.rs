@@ -149,6 +149,10 @@ pub trait Vm {
     /// [`VmExit::Hlt`].
     fn init_platform(&self) -> Result<()>;
 
+    /// Drive an interrupt line of the emulated interrupt controllers high or
+    /// low. Lines 0-15 are the ISA IRQs. Requires [`Vm::init_platform`].
+    fn set_irq_line(&self, irq: u32, level: bool) -> Result<()>;
+
     fn create_vcpu(&self, id: u32) -> Result<Self::Vcpu>;
 }
 

@@ -5,7 +5,7 @@ A from-scratch virtual machine monitor in Rust. Working name; rename freely.
 ## Layout
 
 - `crates/hypervisor` — backend-agnostic traits (`Hypervisor`, `Vm`, `Vcpu`, `VmExit`), x86-64 register types, and the KVM backend. A WHPX backend slots in here later.
-- `crates/vmm` — the binary: guest memory, x86-64 boot setup and Linux boot protocol (`arch/x86_64`), legacy port I/O stub (`platform.rs`), vCPU run loop.
+- `crates/vmm` — the binary: guest memory, x86-64 boot setup and Linux boot protocol (`arch/x86_64`), emulated devices (`devices/`), the legacy PC platform that maps them to I/O ports (`platform.rs`), vCPU run loop.
 - `crates/vmm/guests` — assembly sources for the built-in test guests.
 
 ## Requirements
@@ -38,14 +38,16 @@ curl -L -o guest/vmlinuz-virt \
 
 `guest/` is git-ignored.
 
-### What to expect (Day 3)
+### What to expect (Day 4)
 
-There is no root filesystem yet, so a successful boot is the full kernel log ending in a panic, after which the guest resets and the VMM exits:
+There is no root filesystem yet, so a successful boot is the full kernel log ending in a panic, after which the guest resets and the VMM exits. COM1 is a real 16550A, so the 8250 driver detects it:
 
 ```
 kvm api version 12
 kernel loaded at 0x100000..0x..., entry 0x100200
 [    0.000000] Linux version ...
+...
+[    ...] 00:00: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A
 ...
 [    ...] Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)
 guest requested reset
@@ -55,18 +57,11 @@ guest requested reset
 
 To include the kernel boot in the test suite: `VMM_TEST_KERNEL=$PWD/guest/vmlinuz-virt cargo test`.
 
-If the log stops right after a `console [ttyS0] enabled` line, add `keep` to the early console, which keeps it printing for the whole boot:
-
-```sh
-cargo run -- --kernel guest/vmlinuz-virt --cmdline \
-  "earlyprintk=serial,ttyS0,115200,keep nokaslr reboot=k panic=-1 pci=off"
-```
-
 ## Progress
 
 - [x] Day 1 — VM, guest memory, one vCPU, real-mode stub, PIO and HLT exits
 - [x] Day 2 — 64-bit long mode: boot GDT, identity-mapped page tables, CPUID, register setup
 - [x] Day 3 — load a bzImage via the Linux boot protocol; in-kernel PIC/IOAPIC/LAPIC/PIT
-- [ ] Day 4 — 8250 serial, kernel printk
+- [x] Day 4 — 16550A UART on COM1 with interrupts; the kernel's 8250 driver detects and uses it
 - [ ] Day 5 — initrd, shell prompt
 - [ ] Day 6 — exit and boot-time instrumentation, baselines

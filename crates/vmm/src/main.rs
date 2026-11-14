@@ -1,6 +1,7 @@
-//! Day 3: load a Linux bzImage and start it through the 64-bit boot protocol.
+//! Day 4: boot Linux with a real 16550A serial console on COM1.
 
 mod arch;
+mod devices;
 mod guest;
 mod platform;
 
@@ -15,24 +16,19 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestM
 
 use arch::x86_64::layout::{HIMEM_START, MAX_MEM_SIZE};
 use arch::x86_64::{linux, regs};
-use platform::{Access, PioOutcome, Platform};
+use platform::{Access, PioOutcome, Platform, COM1_IRQ};
 
 const DEFAULT_MEM_MIB: u64 = 512;
 /// The built-in test guest writes at 64 MiB.
 const MIN_MEM_MIB: u64 = 128;
 
-/// - `earlyprintk=serial,ttyS0,115200`: log to COM1 from the first line of
-///   boot, before any driver is up.
-/// - `console=ttyS0`: the 8250 console driver then takes over. It only needs
-///   "transmitter ready" and "write a byte", which the port stub provides;
-///   the full device model arrives on Day 4.
-/// - `nokaslr`: load at the same address every boot.
+/// - `console=ttyS0`: kernel log on COM1. Registering the console replays
+///   everything logged before it came up, so nothing is lost.
 /// - `reboot=k panic=-1`: with no root filesystem yet the kernel panics at
 ///   the end of boot; make it reset through the keyboard controller straight
 ///   away, which the VMM treats as "stop".
 /// - `pci=off`: there is no PCI bus to probe.
-const DEFAULT_CMDLINE: &str =
-    "earlyprintk=serial,ttyS0,115200 console=ttyS0 nokaslr reboot=k panic=-1 pci=off";
+const DEFAULT_CMDLINE: &str = "console=ttyS0 reboot=k panic=-1 pci=off";
 
 const USAGE: &str = "\
 usage: vmm [options]
@@ -195,6 +191,8 @@ fn run_vm<H: Hypervisor>(
         }
     }
 
+    // Whether the VM has interrupt controllers to deliver device IRQs to.
+    let has_irqchip = matches!(payload, Payload::Linux { .. });
     let mut vcpu = match payload {
         Payload::Raw(code) => {
             mem.write_slice(code, GuestAddress(HIMEM_START))?;
@@ -218,6 +216,7 @@ fn run_vm<H: Hypervisor>(
     };
 
     let mut platform = Platform::new(serial);
+    let mut com1_irq_level = false;
     let mut stats = ExitStats::default();
     let started = Instant::now();
     let result = loop {
@@ -244,6 +243,15 @@ fn run_vm<H: Hypervisor>(
                 dump_state(&vcpu);
                 break Err("guest shut down unexpectedly (triple fault?)".into());
             }
+        }
+        // Device state only changes on guest accesses for now, so this is
+        // the one place the interrupt line can change.
+        let level = platform.com1_interrupt();
+        if has_irqchip && level != com1_irq_level {
+            if let Err(e) = vm.set_irq_line(COM1_IRQ, level) {
+                break Err(e.into());
+            }
+            com1_irq_level = level;
         }
     };
     stats.run_time = started.elapsed();
@@ -391,6 +399,10 @@ mod tests {
 
             let log = String::from_utf8_lossy(&serial);
             assert!(log.contains("Linux version"), "no kernel banner in:\n{log}");
+            assert!(
+                log.contains("ttyS0 at I/O 0x3f8") && log.contains("16550A"),
+                "8250 driver did not detect COM1 as a 16550A in:\n{log}"
+            );
             assert_eq!(reason, StopReason::Reset);
         }
     }

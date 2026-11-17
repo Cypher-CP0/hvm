@@ -1,6 +1,6 @@
-# tvm
+# hvm
 
-tvm is a virtual machine monitor written in Rust. It runs Linux guests on KVM with a deliberately small device model: no firmware, no legacy hardware beyond what a kernel needs to boot, and a short path between the guest and the host for everything else.
+hvm is a virtual machine monitor written in Rust. It runs Linux guests on KVM with a deliberately small device model: no firmware, no legacy hardware beyond what a kernel needs to boot, and a short path between the guest and the host for everything else.
 
 It is built around one rule: every VM exit has to be accounted for. Each run reports how many exits the guest caused, which addresses caused them and what they cost, so that a change can be judged by measurement.
 
@@ -15,7 +15,7 @@ It is built around one rule: every VM exit has to be accounted for. Each run rep
 ## Layout
 
 - `crates/hypervisor` — backend-agnostic traits (`Hypervisor`, `Vm`, `Vcpu`, `IrqLine`, `VmExit`), x86-64 register types, and the KVM backend.
-- `crates/vmm` — the binary:
+- `crates/hvm` — the binary:
   - `arch/x86_64` — memory layout, GDT, page tables, boot registers, Linux boot protocol
   - `devices` — emulated devices (16550A UART, i8042)
   - `platform.rs` — maps devices to the legacy PC I/O ports
@@ -93,7 +93,7 @@ scripts/boot-bench.sh                      # boot time against QEMU microvm
 
 `--bench-exits` runs two guests that do nothing but exit: one with an instruction the hypervisor answers itself, one with a port write that travels to the VMM and back. The difference is the price of involving user space.
 
-`scripts/boot-bench.sh` boots the same kernel repeatedly under tvm and, if it is installed, QEMU's `microvm` machine. Each boot is timed from starting the VMM to the kernel's final panic line appearing on the console (there is no root filesystem). It prints the wall-clock time, which is what a user waits, and the kernel's own timestamp on that line, which leaves out VMM start-up, firmware and decompression.
+`scripts/boot-bench.sh` boots the same kernel repeatedly under hvm and, if it is installed, QEMU's `microvm` machine. Each boot is timed from starting the VMM to the kernel's final panic line appearing on the console (there is no root filesystem). It prints the wall-clock time, which is what a user waits, and the kernel's own timestamp on that line, which leaves out VMM start-up, firmware and decompression.
 
 Inside WSL2 every exit passes through a second hypervisor, which makes exits several times more expensive than on bare-metal Linux. Compare VMMs on the same host, and take absolute numbers on bare metal.
 
@@ -106,8 +106,8 @@ cargo test
 Tests that need KVM skip themselves when `/dev/kvm` is missing. Tests that boot a real kernel are opt-in:
 
 ```sh
-VMM_TEST_KERNEL=$PWD/guest/vmlinuz-virt \
-VMM_TEST_INITRD=$PWD/guest/initramfs-virt cargo test
+HVM_TEST_KERNEL=$PWD/guest/vmlinuz-virt \
+HVM_TEST_INITRD=$PWD/guest/initramfs-virt cargo test
 ```
 
 This boots the kernel twice: once with no root filesystem, and once to a shell that is sent a command and a reboot.

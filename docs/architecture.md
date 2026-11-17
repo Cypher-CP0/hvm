@@ -1,12 +1,12 @@
 # Architecture
 
-tvm is a type-2 virtual machine monitor: a user-space process that asks the host kernel's hypervisor (KVM) to run guest code on the real CPU, and steps in only when the guest does something the hypervisor cannot finish on its own. This document describes how the pieces fit together.
+hvm is a type-2 virtual machine monitor: a user-space process that asks the host kernel's hypervisor (KVM) to run guest code on the real CPU, and steps in only when the guest does something the hypervisor cannot finish on its own. This document describes how the pieces fit together.
 
 ## The two crates
 
 ```
 crates/hypervisor     what a hypervisor can do, and KVM's way of doing it
-crates/vmm            the machine built on top: memory, boot, devices, run loop
+crates/hvm            the machine built on top: memory, boot, devices, run loop
 ```
 
 `hypervisor` defines four traits and the types they exchange:
@@ -20,11 +20,11 @@ crates/vmm            the machine built on top: memory, boot, devices, run loop
 
 `Vcpu::run` returns a `VmExit`: a port read or write, an MMIO read or write, a halt, a shutdown, or an interruption by a signal. Register state crosses the boundary as plain structs (`StandardRegs`, `SpecialRegs`, `Segment`), not as KVM's own types.
 
-Nothing in `vmm` names KVM except the one line that constructs the backend. Everything else is generic over the traits. That is what lets a second backend, such as the Windows Hypervisor Platform, be added without touching boot code or devices.
+Nothing in `hvm` names KVM except the one line that constructs the backend. Everything else is generic over the traits. That is what lets a second backend, such as the Windows Hypervisor Platform, be added without touching boot code or devices.
 
 ## Starting a guest
 
-There is no firmware. A physical PC starts in 16-bit real mode and its BIOS and bootloader work their way up to 64-bit mode before the kernel runs. A hypervisor can load the end state directly, so tvm does:
+There is no firmware. A physical PC starts in 16-bit real mode and its BIOS and bootloader work their way up to 64-bit mode before the kernel runs. A hypervisor can load the end state directly, so hvm does:
 
 1. **Memory.** Guest RAM is one anonymous host mapping, registered with the hypervisor at guest physical address 0. The host allocates pages lazily, so an idle guest costs only what it has touched.
 2. **Kernel.** The protected-mode part of the bzImage is copied to 1 MiB. An initrd, if given, goes at the top of RAM.
@@ -50,7 +50,7 @@ loop {
 }
 ```
 
-Most of what a guest does never reaches this loop. Timer interrupts, the interrupt controllers, CPUID, the paravirtual clock and an idle CPU's HLT are all handled inside the hypervisor. What does reach it is I/O on devices tvm emulates.
+Most of what a guest does never reaches this loop. Timer interrupts, the interrupt controllers, CPUID, the paravirtual clock and an idle CPU's HLT are all handled inside the hypervisor. What does reach it is I/O on devices hvm emulates.
 
 Each trip costs a transition out of the guest, into the host kernel, out to user space and back. Keeping the number of trips down, and each one short, is most of what makes a VMM fast.
 

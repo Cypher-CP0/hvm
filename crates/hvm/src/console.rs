@@ -150,7 +150,7 @@ impl<R: Read> Read for TerminalInput<R> {
                     // there is no way to interrupt it yet, so leave from
                     // here. Guest output still buffered is lost.
                     restore_terminal();
-                    eprintln!("\nvmm: terminated by Ctrl-A x");
+                    eprintln!("\nhvm: terminated by Ctrl-A x");
                     std::process::exit(0);
                 }
             }

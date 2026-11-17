@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compare kernel boot time under tvm and under QEMU's microvm machine.
+# Compare kernel boot time under hvm and under QEMU's microvm machine.
 #
 # Both boot the same kernel with the same command line and no root
 # filesystem, which ends in a kernel panic. Each boot is timed from starting
@@ -37,9 +37,9 @@ if [[ ! -r $KERNEL ]]; then
     exit 1
 fi
 
-echo "building tvm (release)..."
+echo "building hvm (release)..."
 cargo build --release --quiet
-TVM=target/release/vmm
+HVM=target/release/hvm
 
 # boot_once <command...>: run a VMM whose stdout is the guest console until
 # MARKER appears, then stop it. Prints "<wall ms> <guest ms>"; the second is
@@ -101,7 +101,7 @@ bench() {
 }
 
 echo "kernel $KERNEL, $MEM MiB, $RUNS boots each, timed to \"$MARKER\""
-bench "tvm" "$TVM" --kernel "$KERNEL" --mem "$MEM" --cmdline "$CMDLINE"
+bench "hvm" "$HVM" --kernel "$KERNEL" --mem "$MEM" --cmdline "$CMDLINE"
 
 if command -v qemu-system-x86_64 >/dev/null; then
     bench "qemu microvm" qemu-system-x86_64 \

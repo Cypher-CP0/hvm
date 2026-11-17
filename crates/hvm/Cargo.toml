@@ -1,9 +1,9 @@
 [package]
-name = "vmm"
+name = "hvm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The VMM binary: guest memory, device model and vCPU run loop"
+description = "The hvm binary: guest memory, device model and vCPU run loop"
 
 [dependencies]
 hypervisor = { path = "../hypervisor" }

@@ -1,4 +1,4 @@
-//! tvm: a virtual machine monitor for Linux guests on KVM.
+//! hvm: a virtual machine monitor for Linux guests on KVM.
 
 mod arch;
 #[cfg(unix)]
@@ -48,7 +48,7 @@ const BENCH_ITERATIONS: u32 = 100_000;
 const IO_REPORT_ROWS: usize = 10;
 
 const USAGE: &str = "\
-usage: vmm [options]
+usage: hvm [options]
 
 With no --kernel, runs a built-in 64-bit test guest.
 
@@ -686,11 +686,11 @@ mod tests {
         }
 
         /// Boots a real kernel with no root filesystem. Opt in with
-        /// `VMM_TEST_KERNEL=/path/to/bzImage cargo test`.
+        /// `HVM_TEST_KERNEL=/path/to/bzImage cargo test`.
         #[test]
         fn linux_kernel_boots_to_panic_and_resets() {
-            let Ok(path) = std::env::var("VMM_TEST_KERNEL") else {
-                eprintln!("skipping: VMM_TEST_KERNEL is not set");
+            let Ok(path) = std::env::var("HVM_TEST_KERNEL") else {
+                eprintln!("skipping: HVM_TEST_KERNEL is not set");
                 return;
             };
             let Some(hv) = hypervisor() else { return };
@@ -756,15 +756,15 @@ mod tests {
 
         /// Boots to a shell in the initrd, types a command and reboots,
         /// which exercises console input and both UART interrupts. Opt in
-        /// with `VMM_TEST_KERNEL` and `VMM_TEST_INITRD`; the initrd must
+        /// with `HVM_TEST_KERNEL` and `HVM_TEST_INITRD`; the initrd must
         /// contain a busybox-style `/bin/sh`.
         #[test]
         fn linux_shell_accepts_input_and_reboots() {
             let (Ok(kernel), Ok(initrd)) = (
-                std::env::var("VMM_TEST_KERNEL"),
-                std::env::var("VMM_TEST_INITRD"),
+                std::env::var("HVM_TEST_KERNEL"),
+                std::env::var("HVM_TEST_INITRD"),
             ) else {
-                eprintln!("skipping: VMM_TEST_KERNEL and VMM_TEST_INITRD are not both set");
+                eprintln!("skipping: HVM_TEST_KERNEL and HVM_TEST_INITRD are not both set");
                 return;
             };
             let Some(hv) = hypervisor() else { return };
@@ -782,11 +782,11 @@ mod tests {
                 output: serial.clone(),
                 after: "as init process",
                 prompt: "# ",
-                // The shell computes 42, so "vmm-42" can only come from
+                // The shell computes 42, so "hvm-42" can only come from
                 // the command having run, not from the echo of the input.
                 // If there is no reboot applet, leaving the shell panics
                 // the kernel, which resets the machine just the same.
-                script: Some(b"echo vmm-$((6*7)); /bin/busybox reboot -f || exit\n"),
+                script: Some(b"echo hvm-$((6*7)); /bin/busybox reboot -f || exit\n"),
             };
             let timeline = Timeline::new(Instant::now());
             let outcome = run_vm(
@@ -800,7 +800,7 @@ mod tests {
             .unwrap();
 
             let log = serial.contents();
-            assert!(log.contains("vmm-42"), "command output missing in:\n{log}");
+            assert!(log.contains("hvm-42"), "command output missing in:\n{log}");
             assert_eq!(outcome.reason, StopReason::Reset);
             assert!(timeline.get(metrics::EVENT_USERSPACE).is_some());
         }

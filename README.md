@@ -17,8 +17,9 @@ It is built around one rule: every VM exit has to be accounted for. Each run rep
 - `crates/hypervisor` — backend-agnostic traits (`Hypervisor`, `Vm`, `Vcpu`, `IrqLine`, `VmExit`), x86-64 register types, and the KVM backend.
 - `crates/hvm` — the binary:
   - `arch/x86_64` — memory layout, GDT, page tables, boot registers, Linux boot protocol
-  - `devices` — emulated devices (16550A UART, i8042)
-  - `platform.rs` — maps devices to the legacy PC I/O ports
+  - `bus.rs` — the port and MMIO address spaces, and which device owns which range
+  - `devices` — emulated devices (16550A UART, i8042, legacy port stubs)
+  - `platform.rs` — builds the buses and wires the legacy PC devices onto them
   - `console.rs` — the host terminal
   - `metrics.rs` — exit statistics and the boot timeline
   - `guests` — assembly sources for the built-in test guests

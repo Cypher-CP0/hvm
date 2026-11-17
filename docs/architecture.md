@@ -44,9 +44,10 @@ One thread owns the vCPU and does this until the guest stops:
 loop {
     exit = vcpu.run()          // guest code runs on the real CPU
     match exit {
-        port or MMIO access => platform handles it
-        halt, reset         => stop
+        port or MMIO access => the bus finds the device; the device handles it
+        halt                => stop
     }
+    if a device pulled the reset line { stop }
 }
 ```
 
@@ -63,7 +64,11 @@ Each trip costs a transition out of the guest, into the host kernel, out to user
 | `serial.rs` | 16550A UART | The guest console. |
 | `i8042.rs` | Keyboard controller, nothing attached | Answers the kernel's probe; resets the machine. |
 
-`platform.rs` is the wiring. It decides which device owns which I/O port (COM1 at 0x3f8, the keyboard controller at 0x60 and 0x64), and after every access it compares the device's interrupt state with the level last driven on its line and tells the hypervisor only when that changes.
+A machine has two address spaces through which a guest reaches devices: I/O ports and memory-mapped I/O. Each is a `Bus` (`bus.rs`): a sorted list of address ranges, each owned by a device. When an access exits to the VMM, the bus finds the range containing the address and hands the access to its device, along with the range's base and the offset into it. An address nobody claims reads as all ones, which is what an empty bus does on real hardware, and is counted so that it shows up in the report.
+
+The ranges are fixed once the machine is built, so a lookup takes no lock. Each device sits behind its own mutex, held for the length of one access.
+
+`platform.rs` is the wiring. It builds both buses and puts the legacy devices at their fixed ports (COM1 at 0x3f8, the keyboard controller at 0x60 and 0x64). Each device model is wrapped in a small adapter that gives it what a state machine alone lacks: a place on the bus, an interrupt line, and for the keyboard controller the machine's reset line. After every access the adapter compares the device's interrupt state with the level last driven on its line and tells the hypervisor only when that changes.
 
 The interrupt lines are level-accurate: a line stays high for as long as the device has a reason to interrupt. The guest sees the same edges a real 8259 would.
 

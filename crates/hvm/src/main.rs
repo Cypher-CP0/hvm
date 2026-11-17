@@ -1,6 +1,7 @@
 //! hvm: a virtual machine monitor for Linux guests on KVM.
 
 mod arch;
+mod bus;
 #[cfg(unix)]
 mod console;
 mod devices;
@@ -22,7 +23,7 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestM
 use arch::x86_64::layout::{HIMEM_START, MAX_MEM_SIZE};
 use arch::x86_64::{linux, regs};
 use metrics::{BootWatch, ExitStats, Timeline};
-use platform::{Access, Com1, IoCount, PioOutcome, Platform, PlatformIrqs, COM1_IRQ, KEYBOARD_IRQ};
+use platform::{Access, Com1, IoCount, IoOutcome, Platform, PlatformIrqs, COM1_IRQ, KEYBOARD_IRQ};
 
 const DEFAULT_MEM_MIB: u64 = 512;
 /// The built-in test guest writes at 64 MiB.
@@ -199,6 +200,14 @@ fn dump_state<V: Vcpu>(vcpu: &V) {
     }
 }
 
+/// The run loop's reading of an I/O access's outcome: `None` to carry on.
+fn stop_on_reset(outcome: IoOutcome) -> Option<StopReason> {
+    match outcome {
+        IoOutcome::Continue => None,
+        IoOutcome::Reset => Some(StopReason::Reset),
+    }
+}
+
 /// Start a thread that carries bytes from `input` to the guest's COM1.
 ///
 /// The thread ends with the input, or with the process: it is never joined,
@@ -321,7 +330,7 @@ where
     timeline.mark(metrics::EVENT_VCPU_READY);
 
     let serial = BootWatch::new(serial, timeline.clone());
-    let mut platform = Platform::new(serial, irqs);
+    let mut platform = Platform::new(serial, irqs)?;
     if let Some(input) = input {
         spawn_console_input(input, platform.com1())?;
     }
@@ -342,23 +351,22 @@ where
         let kind = exit.kind();
         // `Ok(None)` means carry on.
         let step: Result<Option<StopReason>, Box<dyn Error>> = match exit {
-            VmExit::IoOut { port, data } => match platform.pio_write(port, data) {
-                Ok(PioOutcome::Continue) => Ok(None),
-                Ok(PioOutcome::Reset) => Ok(Some(StopReason::Reset)),
-                Err(e) => Err(e.into()),
-            },
+            VmExit::IoOut { port, data } => platform
+                .pio_write(port, data)
+                .map(stop_on_reset)
+                .map_err(Into::into),
             VmExit::IoIn { port, data } => platform
                 .pio_read(port, data)
                 .map(|()| None)
                 .map_err(Into::into),
-            VmExit::MmioWrite { addr, .. } => {
-                platform.mmio_write(addr);
-                Ok(None)
-            }
-            VmExit::MmioRead { addr, data } => {
-                platform.mmio_read(addr, data);
-                Ok(None)
-            }
+            VmExit::MmioWrite { addr, data } => platform
+                .mmio_write(addr, data)
+                .map(stop_on_reset)
+                .map_err(Into::into),
+            VmExit::MmioRead { addr, data } => platform
+                .mmio_read(addr, data)
+                .map(|()| None)
+                .map_err(Into::into),
             VmExit::Interrupted => Ok(None),
             VmExit::Hlt => Ok(Some(StopReason::Halted)),
             VmExit::Shutdown => {

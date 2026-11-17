@@ -1,33 +1,38 @@
-//! The legacy PC platform: what lives at fixed I/O ports.
+//! The machine's I/O front: the port and MMIO buses, and the legacy PC
+//! devices that sit at fixed ports.
 //!
-//! COM1 is a 16550A and ports 0x60/0x64 are an i8042 keyboard controller.
-//! CMOS is a stub. All of this moves behind a proper device bus in week 2.
+//! The device models in `devices/` are plain state machines. The adapters
+//! here connect one to the rest of the machine: its interrupt line, the
+//! reset line, and the bus.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hypervisor::IrqLine;
 
+use crate::bus::{Bus, BusDevice, BusError};
 use crate::devices::i8042::{I8042Outcome, I8042};
+use crate::devices::legacy::{CmosStub, PostPort};
 use crate::devices::serial::Serial;
 
-const COM1_BASE: u16 = 0x3f8;
-const COM1_END: u16 = 0x3ff;
+const COM1_BASE: u64 = 0x3f8;
+const COM1_LEN: u64 = 8;
 /// ISA interrupt line of COM1.
 pub const COM1_IRQ: u32 = 4;
 /// ISA interrupt line of the keyboard controller.
 pub const KEYBOARD_IRQ: u32 = 1;
 
-const CMOS_INDEX: u16 = 0x70;
-const CMOS_DATA: u16 = 0x71;
-/// POST diagnostic port; Linux writes to it as an I/O delay.
-const POST_PORT: u16 = 0x80;
-const I8042_DATA: u16 = 0x60;
-const I8042_COMMAND: u16 = 0x64;
+const I8042_DATA: u64 = 0x60;
+const I8042_COMMAND: u64 = 0x64;
+const CMOS_BASE: u64 = 0x70;
+const CMOS_LEN: u64 = 2;
+const POST_PORT: u64 = 0x80;
 
+/// What the run loop should do after an I/O access.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PioOutcome {
+pub enum IoOutcome {
     Continue,
     /// The guest asked for a machine reset.
     Reset,
@@ -39,6 +44,21 @@ pub enum Access {
     PioWrite,
     MmioRead,
     MmioWrite,
+}
+
+/// The machine's reset line. Any device may pull it; the run loop looks at
+/// it after every access.
+#[derive(Clone, Default)]
+pub struct ResetLine(Arc<AtomicBool>);
+
+impl ResetLine {
+    pub fn assert(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_asserted(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 /// A device's connection to an interrupt line, which remembers the level it
@@ -84,17 +104,6 @@ impl<W: Write> Com1<W> {
         self.irq.set(self.uart.interrupt_pending())
     }
 
-    fn read(&mut self, offset: u8) -> io::Result<u8> {
-        let value = self.uart.read(offset);
-        self.sync_irq()?;
-        Ok(value)
-    }
-
-    fn write(&mut self, offset: u8, value: u8) -> io::Result<()> {
-        self.uart.write(offset, value)?;
-        self.sync_irq()
-    }
-
     /// Deliver bytes from the outside world to the guest. Returns how many
     /// the UART had room for.
     pub fn receive(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -103,10 +112,65 @@ impl<W: Write> Com1<W> {
         Ok(accepted)
     }
 
+    fn flush(&mut self) -> io::Result<()> {
+        self.uart.flush()
+    }
+
     /// Whether the interrupt line is currently driven high.
     #[cfg(test)]
     pub fn interrupt_asserted(&self) -> bool {
         self.irq.asserted
+    }
+}
+
+impl<W: Write + Send> BusDevice for Com1<W> {
+    fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) -> io::Result<()> {
+        for byte in data.iter_mut() {
+            *byte = self.uart.read(offset as u8);
+        }
+        self.sync_irq()
+    }
+
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> io::Result<()> {
+        // More than one byte means string I/O (`rep outsb`): each byte is a
+        // separate write to the same register.
+        for &byte in data {
+            self.uart.write(offset as u8, byte)?;
+        }
+        self.sync_irq()
+    }
+}
+
+/// The i8042 together with its interrupt line and the machine's reset line.
+/// It claims two one-port ranges and tells them apart by their base.
+struct KeyboardController {
+    i8042: I8042,
+    irq: InterruptPin,
+    reset: ResetLine,
+}
+
+impl BusDevice for KeyboardController {
+    fn read(&mut self, base: u64, _offset: u64, data: &mut [u8]) -> io::Result<()> {
+        for byte in data.iter_mut() {
+            *byte = match base {
+                I8042_COMMAND => self.i8042.read_status(),
+                _ => self.i8042.read_data(),
+            };
+        }
+        self.irq.set(self.i8042.interrupt_pending())
+    }
+
+    fn write(&mut self, base: u64, _offset: u64, data: &[u8]) -> io::Result<()> {
+        for &byte in data {
+            let outcome = match base {
+                I8042_COMMAND => self.i8042.write_command(byte),
+                _ => self.i8042.write_data(byte),
+            };
+            if outcome == I8042Outcome::Reset {
+                self.reset.assert();
+            }
+        }
+        self.irq.set(self.i8042.interrupt_pending())
     }
 }
 
@@ -129,31 +193,51 @@ pub struct PlatformIrqs {
 }
 
 pub struct Platform<W> {
+    pio: Bus,
+    mmio: Bus,
     com1: Arc<Mutex<Com1<W>>>,
-    i8042: I8042,
-    keyboard_irq: InterruptPin,
+    reset: ResetLine,
     /// Every access by address, and whether anything claimed it. Reported at
     /// exit: it shows where exits come from and what the guest probes for.
     accesses: BTreeMap<(Access, u64), (u64, bool)>,
 }
 
-impl<W: Write> Platform<W> {
-    /// `serial` receives what the guest transmits on COM1. `irqs` connects
-    /// the devices to the VM's interrupt controllers, if it has any.
-    pub fn new(serial: W, irqs: Option<PlatformIrqs>) -> Self {
+impl<W: Write + Send + 'static> Platform<W> {
+    /// Build the buses and put the legacy devices on them. `serial`
+    /// receives what the guest transmits on COM1. `irqs` connects the
+    /// devices to the VM's interrupt controllers, if it has any.
+    pub fn new(serial: W, irqs: Option<PlatformIrqs>) -> Result<Self, BusError> {
         let (com1_irq, keyboard_irq) = match irqs {
             Some(irqs) => (Some(irqs.com1), Some(irqs.keyboard)),
             None => (None, None),
         };
-        Self {
-            com1: Arc::new(Mutex::new(Com1 {
-                uart: Serial::new(serial),
-                irq: InterruptPin::new(com1_irq),
-            })),
+        let reset = ResetLine::default();
+        let com1 = Arc::new(Mutex::new(Com1 {
+            uart: Serial::new(serial),
+            irq: InterruptPin::new(com1_irq),
+        }));
+        let keyboard = Arc::new(Mutex::new(KeyboardController {
             i8042: I8042::new(),
-            keyboard_irq: InterruptPin::new(keyboard_irq),
+            irq: InterruptPin::new(keyboard_irq),
+            reset: reset.clone(),
+        }));
+
+        let mut pio = Bus::new();
+        pio.insert(COM1_BASE, COM1_LEN, com1.clone())?;
+        // Port 0x61 in between belongs to the PIT's speaker gate, which the
+        // hypervisor emulates.
+        pio.insert(I8042_DATA, 1, keyboard.clone())?;
+        pio.insert(I8042_COMMAND, 1, keyboard)?;
+        pio.insert(CMOS_BASE, CMOS_LEN, Arc::new(Mutex::new(CmosStub)))?;
+        pio.insert(POST_PORT, 1, Arc::new(Mutex::new(PostPort)))?;
+
+        Ok(Self {
+            pio,
+            mmio: Bus::new(),
+            com1,
+            reset,
             accesses: BTreeMap::new(),
-        }
+        })
     }
 
     /// A handle to COM1 for whoever supplies its input.
@@ -161,85 +245,52 @@ impl<W: Write> Platform<W> {
         Arc::clone(&self.com1)
     }
 
-    pub fn pio_write(&mut self, port: u16, data: &[u8]) -> io::Result<PioOutcome> {
-        let mut outcome = PioOutcome::Continue;
-        let handled = match port {
-            COM1_BASE..=COM1_END => {
-                let mut com1 = self.com1.lock().unwrap();
-                // More than one byte means string I/O (`rep outsb`): each
-                // byte is a separate write to the same register.
-                for &byte in data {
-                    com1.write((port - COM1_BASE) as u8, byte)?;
-                }
-                true
-            }
-            I8042_DATA | I8042_COMMAND => {
-                for &byte in data {
-                    let result = if port == I8042_COMMAND {
-                        self.i8042.write_command(byte)
-                    } else {
-                        self.i8042.write_data(byte)
-                    };
-                    if result == I8042Outcome::Reset {
-                        outcome = PioOutcome::Reset;
-                    }
-                }
-                self.keyboard_irq.set(self.i8042.interrupt_pending())?;
-                true
-            }
-            CMOS_INDEX | CMOS_DATA | POST_PORT => true,
-            _ => false,
-        };
+    /// The MMIO bus, for adding devices while the machine is being built.
+    #[allow(dead_code)] // first used by the virtio-mmio transport
+    pub fn mmio_bus_mut(&mut self) -> &mut Bus {
+        &mut self.mmio
+    }
+
+    fn outcome(&self) -> IoOutcome {
+        if self.reset.is_asserted() {
+            IoOutcome::Reset
+        } else {
+            IoOutcome::Continue
+        }
+    }
+
+    pub fn pio_write(&mut self, port: u16, data: &[u8]) -> io::Result<IoOutcome> {
+        let handled = self.pio.write(port as u64, data)?;
         self.note(Access::PioWrite, port as u64, handled);
-        Ok(outcome)
+        Ok(self.outcome())
     }
 
     pub fn pio_read(&mut self, port: u16, data: &mut [u8]) -> io::Result<()> {
-        let handled = match port {
-            COM1_BASE..=COM1_END => {
-                let mut com1 = self.com1.lock().unwrap();
-                for byte in data.iter_mut() {
-                    *byte = com1.read((port - COM1_BASE) as u8)?;
-                }
-                true
-            }
-            I8042_DATA => {
-                for byte in data.iter_mut() {
-                    *byte = self.i8042.read_data();
-                }
-                self.keyboard_irq.set(self.i8042.interrupt_pending())?;
-                true
-            }
-            I8042_COMMAND => {
-                data.fill(self.i8042.read_status());
-                true
-            }
-            // No RTC. Zero keeps "update in progress" clear, so a guest
-            // that waits on that bit does not spin.
-            CMOS_INDEX | CMOS_DATA => {
-                data.fill(0);
-                true
-            }
-            _ => {
-                data.fill(0xff); // nothing drives the bus
-                false
-            }
-        };
+        let handled = self.pio.read(port as u64, data)?;
+        if !handled {
+            data.fill(0xff); // nothing drives the bus
+        }
         self.note(Access::PioRead, port as u64, handled);
         Ok(())
     }
 
-    pub fn mmio_write(&mut self, addr: u64) {
-        self.note(Access::MmioWrite, addr, false);
+    pub fn mmio_write(&mut self, addr: u64, data: &[u8]) -> io::Result<IoOutcome> {
+        let handled = self.mmio.write(addr, data)?;
+        self.note(Access::MmioWrite, addr, handled);
+        Ok(self.outcome())
     }
 
-    pub fn mmio_read(&mut self, addr: u64, data: &mut [u8]) {
-        self.note(Access::MmioRead, addr, false);
-        data.fill(0xff);
+    pub fn mmio_read(&mut self, addr: u64, data: &mut [u8]) -> io::Result<()> {
+        let handled = self.mmio.read(addr, data)?;
+        if !handled {
+            data.fill(0xff);
+        }
+        self.note(Access::MmioRead, addr, handled);
+        Ok(())
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        self.com1.lock().unwrap().uart.flush()
+        self.com1.lock().unwrap().flush()
     }
 
     fn note(&mut self, access: Access, addr: u64, handled: bool) {
@@ -266,8 +317,6 @@ impl<W: Write> Platform<W> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::*;
 
     /// An interrupt line that records its level.
@@ -292,22 +341,26 @@ mod tests {
     }
 
     fn platform() -> Platform<Vec<u8>> {
-        Platform::new(Vec::new(), None)
+        Platform::new(Vec::new(), None).unwrap()
     }
 
-    fn read<W: Write>(p: &mut Platform<W>, port: u16) -> u8 {
+    fn read(p: &mut Platform<Vec<u8>>, port: u64) -> u8 {
         let mut b = [0xaa];
-        p.pio_read(port, &mut b).unwrap();
+        p.pio_read(port as u16, &mut b).unwrap();
         b[0]
+    }
+
+    fn write(p: &mut Platform<Vec<u8>>, port: u64, data: &[u8]) -> IoOutcome {
+        p.pio_write(port as u16, data).unwrap()
     }
 
     #[test]
     fn com1_ports_reach_the_uart() {
         let mut p = platform();
         assert_eq!(read(&mut p, COM1_BASE + 5) & 0x20, 0x20, "LSR: THR empty");
-        p.pio_write(COM1_BASE, b"o").unwrap();
+        write(&mut p, COM1_BASE, b"o");
         // String I/O delivers several bytes for one port.
-        p.pio_write(COM1_BASE, b"k\n").unwrap();
+        write(&mut p, COM1_BASE, b"k\n");
         assert!(p.io_counts().iter().all(|c| c.handled));
 
         let mut out = Vec::new();
@@ -316,21 +369,32 @@ mod tests {
     }
 
     #[test]
+    fn com1_claims_exactly_its_eight_ports() {
+        let mut p = platform();
+        read(&mut p, COM1_BASE - 1);
+        read(&mut p, COM1_BASE + 7);
+        read(&mut p, COM1_BASE + 8);
+
+        let handled: Vec<_> = p.io_counts().iter().map(|c| (c.addr, c.handled)).collect();
+        assert_eq!(handled, vec![(0x3f7, false), (0x3ff, true), (0x400, false)]);
+    }
+
+    #[test]
     fn com1_interrupt_line_follows_the_uart() {
         let (irqs, level, _) = test_irqs();
-        let mut p = Platform::new(Vec::new(), Some(irqs));
+        let mut p = Platform::new(Vec::new(), Some(irqs)).unwrap();
         let asserted = || level.load(Ordering::SeqCst);
 
         // Enabling the THR-empty interrupt raises the line; reading IIR
         // acknowledges it.
-        p.pio_write(COM1_BASE + 1, &[0x02]).unwrap();
+        write(&mut p, COM1_BASE + 1, &[0x02]);
         assert!(asserted());
         assert_eq!(read(&mut p, COM1_BASE + 2), 0x02);
         assert!(!asserted());
 
         // Received data raises it from another thread's handle, and the
         // guest reading the byte lowers it.
-        p.pio_write(COM1_BASE + 1, &[0x01]).unwrap();
+        write(&mut p, COM1_BASE + 1, &[0x01]);
         let com1 = p.com1();
         assert_eq!(com1.lock().unwrap().receive(b"a").unwrap(), 1);
         assert!(asserted());
@@ -341,40 +405,44 @@ mod tests {
     #[test]
     fn com1_works_without_an_interrupt_line() {
         let mut p = platform();
-        p.pio_write(COM1_BASE + 1, &[0x02]).unwrap();
+        write(&mut p, COM1_BASE + 1, &[0x02]);
         assert!(p.com1().lock().unwrap().interrupt_asserted());
     }
 
     #[test]
-    fn keyboard_controller_answers_and_resets() {
+    fn keyboard_controller_answers_on_both_its_ports() {
         let mut p = platform();
         assert_eq!(read(&mut p, I8042_COMMAND) & 0x03, 0, "buffers empty");
 
         // Read the control register: the reply shows up in the status
         // register and on the data port.
-        p.pio_write(I8042_COMMAND, &[0x20]).unwrap();
+        write(&mut p, I8042_COMMAND, &[0x20]);
         assert_eq!(read(&mut p, I8042_COMMAND) & 0x01, 0x01);
         assert_ne!(read(&mut p, I8042_DATA), 0);
         assert_eq!(read(&mut p, I8042_COMMAND) & 0x01, 0);
 
-        assert_eq!(
-            p.pio_write(I8042_COMMAND, &[0xae]).unwrap(),
-            PioOutcome::Continue
-        );
-        assert_eq!(
-            p.pio_write(I8042_COMMAND, &[0xfe]).unwrap(),
-            PioOutcome::Reset
-        );
+        // The ports in between are not the controller's.
+        assert_eq!(read(&mut p, 0x61), 0xff);
+        assert!(p.io_counts().iter().any(|c| c.addr == 0x61 && !c.handled));
+    }
+
+    #[test]
+    fn keyboard_controller_pulls_the_reset_line() {
+        let mut p = platform();
+        assert_eq!(write(&mut p, I8042_COMMAND, &[0xae]), IoOutcome::Continue);
+        assert_eq!(write(&mut p, I8042_COMMAND, &[0xfe]), IoOutcome::Reset);
+        // The line stays pulled: whatever the guest does next, it has reset.
+        assert_eq!(write(&mut p, POST_PORT, &[0]), IoOutcome::Reset);
     }
 
     #[test]
     fn keyboard_interrupt_line_follows_the_controller() {
         let (irqs, com1, keyboard) = test_irqs();
-        let mut p = Platform::new(Vec::new(), Some(irqs));
+        let mut p = Platform::new(Vec::new(), Some(irqs)).unwrap();
         let asserted = || keyboard.load(Ordering::SeqCst);
 
         // A byte for the absent keyboard is refused through the interrupt.
-        p.pio_write(I8042_DATA, &[0xf2]).unwrap();
+        write(&mut p, I8042_DATA, &[0xf2]);
         assert!(asserted());
         assert_eq!(read(&mut p, I8042_DATA), 0xfe);
         assert!(!asserted());
@@ -386,8 +454,8 @@ mod tests {
         let mut p = platform();
         assert_eq!(read(&mut p, 0xcfc), 0xff);
         assert_eq!(read(&mut p, 0xcfc), 0xff);
-        p.pio_write(0xcf8, &[0, 0, 0, 0x80]).unwrap();
-        p.pio_write(POST_PORT, &[0]).unwrap();
+        write(&mut p, 0xcf8, &[0, 0, 0, 0x80]);
+        write(&mut p, POST_PORT, &[0]);
 
         let unhandled: Vec<_> = p.io_counts().into_iter().filter(|c| !c.handled).collect();
         assert_eq!(
@@ -410,9 +478,59 @@ mod tests {
     }
 
     #[test]
-    fn cmos_never_reports_update_in_progress() {
+    fn cmos_ports_are_claimed() {
         let mut p = platform();
-        p.pio_write(CMOS_INDEX, &[0x0a]).unwrap();
-        assert_eq!(read(&mut p, CMOS_DATA) & 0x80, 0);
+        write(&mut p, CMOS_BASE, &[0x0a]);
+        assert_eq!(read(&mut p, CMOS_BASE + 1) & 0x80, 0);
+        assert!(p.io_counts().iter().all(|c| c.handled));
+    }
+
+    #[test]
+    fn mmio_reaches_devices_added_to_its_bus() {
+        /// One 32-bit register.
+        struct Register(u32);
+
+        impl BusDevice for Register {
+            fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) -> io::Result<()> {
+                assert_eq!(offset, 0x10);
+                data.copy_from_slice(&self.0.to_le_bytes());
+                Ok(())
+            }
+
+            fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> io::Result<()> {
+                self.0 = u32::from_le_bytes(data.try_into().unwrap());
+                Ok(())
+            }
+        }
+
+        let mut p = platform();
+        p.mmio_bus_mut()
+            .insert(0xd000_0000, 0x1000, Arc::new(Mutex::new(Register(0))))
+            .unwrap();
+
+        p.mmio_write(0xd000_0010, &0x7472_6976u32.to_le_bytes())
+            .unwrap();
+        let mut value = [0u8; 4];
+        p.mmio_read(0xd000_0010, &mut value).unwrap();
+        assert_eq!(u32::from_le_bytes(value), 0x7472_6976);
+
+        // Outside the device, reads float and the access is recorded as
+        // unclaimed.
+        p.mmio_read(0xd000_1000, &mut value).unwrap();
+        assert_eq!(value, [0xff; 4]);
+        let unhandled: Vec<_> = p.io_counts().into_iter().filter(|c| !c.handled).collect();
+        assert_eq!(unhandled.len(), 1);
+        assert_eq!(unhandled[0].access, Access::MmioRead);
+        assert_eq!(unhandled[0].addr, 0xd000_1000);
+    }
+
+    #[test]
+    fn mmio_and_port_address_spaces_are_separate() {
+        let mut p = platform();
+        // COM1's port number means nothing as a memory address.
+        let mut value = [0u8; 1];
+        p.mmio_read(COM1_BASE + 5, &mut value).unwrap();
+        assert_eq!(value, [0xff]);
+        assert!(p.io_counts().iter().all(|c| !c.handled));
     }
 }

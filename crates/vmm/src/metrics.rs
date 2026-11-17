@@ -14,7 +14,8 @@ const USERSPACE_MARKER: &[u8] = b"as init process";
 const MAX_LINE: usize = 256;
 
 pub const EVENT_VM_CREATED: &str = "vm created";
-pub const EVENT_GUEST_LOADED: &str = "guest loaded";
+pub const EVENT_KERNEL_LOADED: &str = "kernel loaded";
+pub const EVENT_VCPU_READY: &str = "vcpu ready";
 pub const EVENT_VCPU_STARTED: &str = "vcpu started";
 pub const EVENT_FIRST_OUTPUT: &str = "first console output";
 pub const EVENT_USERSPACE: &str = "userspace started";

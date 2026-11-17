@@ -16,6 +16,8 @@ const COM1_BASE: u16 = 0x3f8;
 const COM1_END: u16 = 0x3ff;
 /// ISA interrupt line of COM1.
 pub const COM1_IRQ: u32 = 4;
+/// ISA interrupt line of the keyboard controller.
+pub const KEYBOARD_IRQ: u32 = 1;
 
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
@@ -39,30 +41,47 @@ pub enum Access {
     MmioWrite,
 }
 
+/// A device's connection to an interrupt line, which remembers the level it
+/// last drove so that the hypervisor is only told about changes.
+struct InterruptPin {
+    /// `None` when the VM has no interrupt controller to deliver to.
+    line: Option<Box<dyn IrqLine>>,
+    asserted: bool,
+}
+
+impl InterruptPin {
+    fn new(line: Option<Box<dyn IrqLine>>) -> Self {
+        Self {
+            line,
+            asserted: false,
+        }
+    }
+
+    fn set(&mut self, level: bool) -> io::Result<()> {
+        if level != self.asserted {
+            if let Some(line) = &self.line {
+                line.set_level(level).map_err(io::Error::other)?;
+            }
+            self.asserted = level;
+        }
+        Ok(())
+    }
+}
+
 /// COM1: the UART together with its interrupt line.
 ///
 /// Shared between the vCPU thread, which handles the guest's port accesses,
 /// and the console input thread, which delivers received bytes.
 pub struct Com1<W> {
     uart: Serial<W>,
-    /// `None` when the VM has no interrupt controller to deliver to.
-    irq: Option<Box<dyn IrqLine>>,
-    /// The level the line was last driven to.
-    asserted: bool,
+    irq: InterruptPin,
 }
 
 impl<W: Write> Com1<W> {
     /// Bring the interrupt line in step with the UART. Must follow every
     /// operation that can change the UART's interrupt state.
     fn sync_irq(&mut self) -> io::Result<()> {
-        let level = self.uart.interrupt_pending();
-        if level != self.asserted {
-            if let Some(irq) = &self.irq {
-                irq.set_level(level).map_err(io::Error::other)?;
-            }
-            self.asserted = level;
-        }
-        Ok(())
+        self.irq.set(self.uart.interrupt_pending())
     }
 
     fn read(&mut self, offset: u8) -> io::Result<u8> {
@@ -87,7 +106,7 @@ impl<W: Write> Com1<W> {
     /// Whether the interrupt line is currently driven high.
     #[cfg(test)]
     pub fn interrupt_asserted(&self) -> bool {
-        self.asserted
+        self.irq.asserted
     }
 }
 
@@ -101,25 +120,38 @@ pub struct IoCount {
     pub handled: bool,
 }
 
+/// The interrupt lines the platform's devices are wired to.
+pub struct PlatformIrqs {
+    /// [`COM1_IRQ`].
+    pub com1: Box<dyn IrqLine>,
+    /// [`KEYBOARD_IRQ`].
+    pub keyboard: Box<dyn IrqLine>,
+}
+
 pub struct Platform<W> {
     com1: Arc<Mutex<Com1<W>>>,
     i8042: I8042,
+    keyboard_irq: InterruptPin,
     /// Every access by address, and whether anything claimed it. Reported at
     /// exit: it shows where exits come from and what the guest probes for.
     accesses: BTreeMap<(Access, u64), (u64, bool)>,
 }
 
 impl<W: Write> Platform<W> {
-    /// `serial` receives what the guest transmits on COM1; `com1_irq` is the
-    /// line the UART interrupts on.
-    pub fn new(serial: W, com1_irq: Option<Box<dyn IrqLine>>) -> Self {
+    /// `serial` receives what the guest transmits on COM1. `irqs` connects
+    /// the devices to the VM's interrupt controllers, if it has any.
+    pub fn new(serial: W, irqs: Option<PlatformIrqs>) -> Self {
+        let (com1_irq, keyboard_irq) = match irqs {
+            Some(irqs) => (Some(irqs.com1), Some(irqs.keyboard)),
+            None => (None, None),
+        };
         Self {
             com1: Arc::new(Mutex::new(Com1 {
                 uart: Serial::new(serial),
-                irq: com1_irq,
-                asserted: false,
+                irq: InterruptPin::new(com1_irq),
             })),
             i8042: I8042::new(),
+            keyboard_irq: InterruptPin::new(keyboard_irq),
             accesses: BTreeMap::new(),
         }
     }
@@ -152,6 +184,7 @@ impl<W: Write> Platform<W> {
                         outcome = PioOutcome::Reset;
                     }
                 }
+                self.keyboard_irq.set(self.i8042.interrupt_pending())?;
                 true
             }
             CMOS_INDEX | CMOS_DATA | POST_PORT => true,
@@ -174,6 +207,7 @@ impl<W: Write> Platform<W> {
                 for byte in data.iter_mut() {
                     *byte = self.i8042.read_data();
                 }
+                self.keyboard_irq.set(self.i8042.interrupt_pending())?;
                 true
             }
             I8042_COMMAND => {
@@ -246,6 +280,17 @@ mod tests {
         }
     }
 
+    /// Recording lines for both devices: `(irqs, com1 level, keyboard level)`.
+    fn test_irqs() -> (PlatformIrqs, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let com1 = Arc::new(AtomicBool::new(false));
+        let keyboard = Arc::new(AtomicBool::new(false));
+        let irqs = PlatformIrqs {
+            com1: Box::new(TestLine(Arc::clone(&com1))),
+            keyboard: Box::new(TestLine(Arc::clone(&keyboard))),
+        };
+        (irqs, com1, keyboard)
+    }
+
     fn platform() -> Platform<Vec<u8>> {
         Platform::new(Vec::new(), None)
     }
@@ -272,9 +317,8 @@ mod tests {
 
     #[test]
     fn com1_interrupt_line_follows_the_uart() {
-        let level = Arc::new(AtomicBool::new(false));
-        let line = TestLine(Arc::clone(&level));
-        let mut p = Platform::new(Vec::new(), Some(Box::new(line)));
+        let (irqs, level, _) = test_irqs();
+        let mut p = Platform::new(Vec::new(), Some(irqs));
         let asserted = || level.load(Ordering::SeqCst);
 
         // Enabling the THR-empty interrupt raises the line; reading IIR
@@ -321,6 +365,20 @@ mod tests {
             p.pio_write(I8042_COMMAND, &[0xfe]).unwrap(),
             PioOutcome::Reset
         );
+    }
+
+    #[test]
+    fn keyboard_interrupt_line_follows_the_controller() {
+        let (irqs, com1, keyboard) = test_irqs();
+        let mut p = Platform::new(Vec::new(), Some(irqs));
+        let asserted = || keyboard.load(Ordering::SeqCst);
+
+        // A byte for the absent keyboard is refused through the interrupt.
+        p.pio_write(I8042_DATA, &[0xf2]).unwrap();
+        assert!(asserted());
+        assert_eq!(read(&mut p, I8042_DATA), 0xfe);
+        assert!(!asserted());
+        assert!(!com1.load(Ordering::SeqCst), "COM1's line is untouched");
     }
 
     #[test]

@@ -16,13 +16,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hypervisor::{Hypervisor, IrqLine, Vcpu, Vm, VmExit};
+use hypervisor::{Hypervisor, Vcpu, Vm, VmExit};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
 
 use arch::x86_64::layout::{HIMEM_START, MAX_MEM_SIZE};
 use arch::x86_64::{linux, regs};
 use metrics::{BootWatch, ExitStats, Timeline};
-use platform::{Access, Com1, IoCount, PioOutcome, Platform, COM1_IRQ};
+use platform::{Access, Com1, IoCount, PioOutcome, Platform, PlatformIrqs, COM1_IRQ, KEYBOARD_IRQ};
 
 const DEFAULT_MEM_MIB: u64 = 512;
 /// The built-in test guest writes at 64 MiB.
@@ -282,8 +282,8 @@ where
 
     timeline.mark(metrics::EVENT_VM_CREATED);
 
-    // The interrupt line for COM1, if the VM has interrupt controllers.
-    let mut com1_irq: Option<Box<dyn IrqLine>> = None;
+    // Interrupt lines for the devices, if the VM has interrupt controllers.
+    let mut irqs: Option<PlatformIrqs> = None;
     let mut vcpu = match payload {
         Payload::Raw(code) => {
             mem.write_slice(code, GuestAddress(HIMEM_START))?;
@@ -297,6 +297,7 @@ where
             cmdline,
         } => {
             let kernel = linux::load_kernel(&mem, mem_size, image, initrd, cmdline)?;
+            timeline.mark(metrics::EVENT_KERNEL_LOADED);
             eprintln!(
                 "kernel loaded at {HIMEM_START:#x}..{:#x}, entry {:#x}",
                 kernel.image_end, kernel.entry
@@ -306,7 +307,10 @@ where
             }
             // Interrupt controllers must exist before the vCPU does.
             vm.init_platform()?;
-            com1_irq = Some(Box::new(vm.irq_line(COM1_IRQ)?));
+            irqs = Some(PlatformIrqs {
+                com1: Box::new(vm.irq_line(COM1_IRQ)?),
+                keyboard: Box::new(vm.irq_line(KEYBOARD_IRQ)?),
+            });
             let mut vcpu = vm.create_vcpu(0)?;
             regs::setup_long_mode(&mut vcpu, &mem, kernel.entry, kernel.boot_params)?;
             regs::setup_lapic(&mut vcpu)?;
@@ -314,10 +318,10 @@ where
         }
     };
 
-    timeline.mark(metrics::EVENT_GUEST_LOADED);
+    timeline.mark(metrics::EVENT_VCPU_READY);
 
     let serial = BootWatch::new(serial, timeline.clone());
-    let mut platform = Platform::new(serial, com1_irq);
+    let mut platform = Platform::new(serial, irqs);
     if let Some(input) = input {
         spawn_console_input(input, platform.com1())?;
     }

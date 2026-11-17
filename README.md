@@ -23,6 +23,7 @@ It is built around one rule: every VM exit has to be accounted for. Each run rep
   - `metrics.rs` — exit statistics and the boot timeline
   - `guests` — assembly sources for the built-in test guests
 - `scripts` — benchmarks.
+- `docs/architecture.md` — how the pieces fit together.
 
 ## Requirements
 
@@ -79,7 +80,7 @@ Without an initrd there is no root filesystem, so the boot ends in a kernel pani
 
 Every run ends with three tables on stderr:
 
-- **timeline** — when the VM was created, the guest loaded, the vCPU started, the first console byte appeared, user space started, and the guest stopped, measured from process start.
+- **timeline** — when the VM was created, the kernel loaded, the vCPU ready and started, the first console byte appeared, user space started, and the guest stopped, measured from process start.
 - **vm exits** — count per exit kind, and the time the VMM spent handling them. The run time is split into time inside the guest and hypervisor, and time in the VMM.
 - **i/o by address** — the ports and MMIO addresses the guest touched most, and any that no device claimed.
 
@@ -92,7 +93,7 @@ scripts/boot-bench.sh                      # boot time against QEMU microvm
 
 `--bench-exits` runs two guests that do nothing but exit: one with an instruction the hypervisor answers itself, one with a port write that travels to the VMM and back. The difference is the price of involving user space.
 
-`scripts/boot-bench.sh` boots the same kernel repeatedly under tvm and, if it is installed, QEMU's `microvm` machine, and prints the minimum, median and maximum wall-clock time.
+`scripts/boot-bench.sh` boots the same kernel repeatedly under tvm and, if it is installed, QEMU's `microvm` machine. Each boot is timed from starting the VMM to the kernel's final panic line appearing on the console (there is no root filesystem). It prints the wall-clock time, which is what a user waits, and the kernel's own timestamp on that line, which leaves out VMM start-up, firmware and decompression.
 
 Inside WSL2 every exit passes through a second hypervisor, which makes exits several times more expensive than on bare-metal Linux. Compare VMMs on the same host, and take absolute numbers on bare metal.
 

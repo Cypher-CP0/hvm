@@ -5,8 +5,10 @@
 //! attached. It is also how a PC is reset: the controller's output port
 //! drives the CPU reset line.
 //!
-//! No keyboard or mouse is emulated. Bytes the guest sends to a device go
-//! unanswered, as they would with the ports empty.
+//! No keyboard or mouse is emulated. A byte the guest sends to the keyboard
+//! is refused with a "resend" reply, which is how a driver finds out at once
+//! that nothing is listening. Silence would be just as truthful, but costs
+//! the guest a 200 ms timeout per attempt.
 
 // Controller commands, written to the command port.
 const CMD_READ_CTR: u8 = 0x20;
@@ -29,6 +31,9 @@ const STATUS_SYSTEM: u8 = 0x04;
 /// Status: the keyboard lock switch is open (not locked).
 const STATUS_UNLOCKED: u8 = 0x10;
 
+/// Control register: raise the keyboard interrupt when a byte from the
+/// keyboard is waiting.
+const CTR_KBD_INT: u8 = 0x01;
 /// Control register: keyboard interface disabled.
 const CTR_KBD_DISABLE: u8 = 0x10;
 /// Power-on control register: keyboard interrupt on, system flag, scancode
@@ -44,6 +49,8 @@ const SELF_TEST_PASSED: u8 = 0x55;
 const KBD_TEST_PASSED: u8 = 0x00;
 /// Port test result "clock line stuck low": no usable mouse port.
 const AUX_TEST_FAILED: u8 = 0x01;
+/// PS/2 "resend": the last byte was not received properly.
+const KBD_RESEND: u8 = 0xfe;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum I8042Outcome {
@@ -57,6 +64,9 @@ pub struct I8042 {
     /// The output buffer: one byte waiting for the guest to read from the
     /// data port. As on the real chip, a new reply replaces an unread one.
     output: Option<u8>,
+    /// Whether the byte in the output buffer came from the keyboard port
+    /// rather than from the controller itself.
+    output_from_kbd: bool,
     /// A command that takes its argument from the next data port write.
     awaiting_data: Option<u8>,
 }
@@ -72,6 +82,7 @@ impl I8042 {
         Self {
             ctr: CTR_DEFAULT,
             output: None,
+            output_from_kbd: false,
             awaiting_data: None,
         }
     }
@@ -88,23 +99,36 @@ impl I8042 {
 
     /// Read the data port.
     pub fn read_data(&mut self) -> u8 {
+        self.output_from_kbd = false;
         self.output.take().unwrap_or(0)
+    }
+
+    /// Whether the controller is asserting the keyboard interrupt (IRQ 1):
+    /// a byte from the keyboard is waiting and the interrupt is enabled.
+    pub fn interrupt_pending(&self) -> bool {
+        self.output.is_some() && self.output_from_kbd && self.ctr & CTR_KBD_INT != 0
+    }
+
+    /// Place a reply from the controller itself in the output buffer.
+    fn reply(&mut self, value: u8) {
+        self.output = Some(value);
+        self.output_from_kbd = false;
     }
 
     /// Write the command port.
     pub fn write_command(&mut self, command: u8) -> I8042Outcome {
         self.awaiting_data = None;
         match command {
-            CMD_READ_CTR => self.output = Some(self.ctr),
+            CMD_READ_CTR => self.reply(self.ctr),
             CMD_WRITE_CTR | CMD_WRITE_OUTPUT_PORT | CMD_AUX_LOOP => {
                 self.awaiting_data = Some(command)
             }
-            CMD_SELF_TEST => self.output = Some(SELF_TEST_PASSED),
-            CMD_KBD_TEST => self.output = Some(KBD_TEST_PASSED),
-            CMD_AUX_TEST => self.output = Some(AUX_TEST_FAILED),
+            CMD_SELF_TEST => self.reply(SELF_TEST_PASSED),
+            CMD_KBD_TEST => self.reply(KBD_TEST_PASSED),
+            CMD_AUX_TEST => self.reply(AUX_TEST_FAILED),
             CMD_KBD_DISABLE => self.ctr |= CTR_KBD_DISABLE,
             CMD_KBD_ENABLE => self.ctr &= !CTR_KBD_DISABLE,
-            CMD_READ_OUTPUT_PORT => self.output = Some(OUTPUT_PORT_DEFAULT),
+            CMD_READ_OUTPUT_PORT => self.reply(OUTPUT_PORT_DEFAULT),
             CMD_PULSE_RESET => return I8042Outcome::Reset,
             // Everything else needs no reply.
             _ => {}
@@ -123,8 +147,15 @@ impl I8042 {
             // The byte would come back from the mouse port, flagged as mouse
             // data. There is no such port, so it comes back unflagged, which
             // tells the guest so without making it wait for a timeout.
-            Some(CMD_AUX_LOOP) => self.output = Some(value),
-            // No keyboard attached: nothing acknowledges the byte.
+            Some(CMD_AUX_LOOP) => self.reply(value),
+            // A byte for the keyboard. With the interface enabled and no
+            // keyboard on it, the answer is "resend".
+            None if self.ctr & CTR_KBD_DISABLE == 0 => {
+                self.output = Some(KBD_RESEND);
+                self.output_from_kbd = true;
+            }
+            // Interface disabled, or an argument for a command that takes
+            // none: dropped.
             _ => {}
         }
         I8042Outcome::Continue
@@ -206,12 +237,54 @@ mod tests {
         assert_eq!(c.read_status() & STATUS_OUTPUT_FULL, 0);
     }
 
+    /// What Linux's atkbd driver does when it probes the keyboard port:
+    /// each command byte must be refused straight away, through the
+    /// interrupt, so that the probe fails without waiting for a timeout.
     #[test]
-    fn bytes_for_the_keyboard_go_unanswered() {
+    fn bytes_for_the_keyboard_are_refused_with_an_interrupt() {
         let mut c = I8042::new();
-        // "Identify keyboard", with no command pending.
-        assert_eq!(c.write_data(0xf2), I8042Outcome::Continue);
+        assert!(!c.interrupt_pending());
+
+        // "Identify keyboard", sent twice because the driver retries once.
+        for _ in 0..2 {
+            assert_eq!(c.write_data(0xf2), I8042Outcome::Continue);
+            assert!(c.interrupt_pending());
+            assert_eq!(c.read_status() & STATUS_OUTPUT_FULL, STATUS_OUTPUT_FULL);
+            assert_eq!(c.read_data(), KBD_RESEND);
+            assert!(!c.interrupt_pending(), "reading the byte drops the line");
+        }
+    }
+
+    #[test]
+    fn keyboard_interrupt_respects_the_control_register() {
+        let mut c = I8042::new();
+
+        // Interrupt disabled: the refusal is still readable, but silent.
+        c.write_command(CMD_WRITE_CTR);
+        c.write_data(CTR_DEFAULT & !CTR_KBD_INT);
+        c.write_data(0xf2);
+        assert!(!c.interrupt_pending());
+        assert_eq!(c.read_data(), KBD_RESEND);
+
+        // Interface disabled: the byte goes nowhere.
+        c.write_command(CMD_KBD_DISABLE);
+        c.write_data(0xf2);
         assert_eq!(c.read_status() & STATUS_OUTPUT_FULL, 0);
+    }
+
+    #[test]
+    fn controller_replies_do_not_raise_the_keyboard_interrupt() {
+        let mut c = I8042::new();
+        c.write_command(CMD_READ_CTR);
+        assert_eq!(c.read_status() & STATUS_OUTPUT_FULL, STATUS_OUTPUT_FULL);
+        assert!(!c.interrupt_pending());
+
+        // A controller reply that replaces a keyboard byte clears the line.
+        c.read_data();
+        c.write_data(0xf2);
+        assert!(c.interrupt_pending());
+        c.write_command(CMD_SELF_TEST);
+        assert!(!c.interrupt_pending());
     }
 
     #[test]
@@ -219,7 +292,9 @@ mod tests {
         let mut c = I8042::new();
         c.write_command(CMD_WRITE_CTR);
         c.write_command(CMD_KBD_ENABLE);
+        // With no command pending this is a byte for the keyboard.
         c.write_data(0x00);
+        assert_eq!(c.read_data(), KBD_RESEND);
         c.write_command(CMD_READ_CTR);
         assert_eq!(c.read_data(), CTR_DEFAULT, "0x00 was not taken as the CTR");
     }
